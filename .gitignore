@@ -1,0 +1,16 @@
+# Build output
+build/
+
+# Model files (large binaries — keep locally)
+models/*.gguf
+models/*.bin
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Compile output stash
+/ai-agent

@@ -33,3 +33,26 @@ target_compile_options(ai-agent PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-O3 -march=native -Wall -Wextra>
     $<$<CXX_COMPILER_ID:MSVC>:/O2 /W3>
 )
+
+# ── Tests (no llama dependency) ───────────────────────────────────────────────
+enable_testing()
+
+# Shared tools object (no llama, no readline)
+add_library(tools-lib OBJECT src/tools.cpp)
+target_include_directories(tools-lib PUBLIC src/)
+target_link_libraries(tools-lib PUBLIC nlohmann_json::nlohmann_json)
+target_compile_options(tools-lib PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -Wall -Wextra>)
+
+add_executable(test_parsing tests/test_parsing.cpp)
+target_include_directories(test_parsing PRIVATE src/)
+target_compile_options(test_parsing PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-O0 -g -Wall -Wextra>)
+add_test(NAME test_parsing COMMAND test_parsing)
+
+add_executable(test_tools tests/test_tools.cpp $<TARGET_OBJECTS:tools-lib>)
+target_include_directories(test_tools PRIVATE src/)
+target_link_libraries(test_tools PRIVATE nlohmann_json::nlohmann_json)
+target_compile_options(test_tools PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-O0 -g -Wall -Wextra>)
+add_test(NAME test_tools COMMAND test_tools)

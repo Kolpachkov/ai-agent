@@ -54,7 +54,8 @@ private:
     std::string build_prompt() const;
     std::string active_system_prompt() const;
     void        eval_string(const std::string& text, bool add_bos, bool parse_special);
-    std::pair<std::string, StopReason> generate_next(StreamCallback cb);
+    std::pair<std::string, StopReason> generate_next(StreamCallback cb,
+                                                       bool has_tool_turns = false);
 
     const ToolRegistry& active_tools() const;
 

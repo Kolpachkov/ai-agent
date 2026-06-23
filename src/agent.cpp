@@ -1,4 +1,5 @@
 #include "agent.hpp"
+#include "parsing.hpp"
 
 #include <llama.h>
 #include <nlohmann/json.hpp>
@@ -18,47 +19,33 @@ namespace fs = std::filesystem;
 static constexpr const char* TURN_OPEN  = "<|turn>";
 static constexpr const char* TURN_CLOSE = "<turn|>";
 
-// Tool call markers — model may use either form
-static const std::vector<std::string> TOOL_OPENS = {
-    "<tool_call>",      // canonical form (what we tell the model)
-    "<|tool_call>",     // Gemma-style alternate form
-};
-static constexpr const char* TOOL_OPEN  = "<tool_call>";   // canonical (for injecting)
-static constexpr const char* TOOL_CLOSE = "</tool_call>";
-
 // Tool response markers (injected by us, model may echo them — suppress)
 static constexpr const char* RESP_OPEN  = "<tool_response>";
 static constexpr const char* RESP_CLOSE = "</tool_response>";
 
 // Stray XML blocks the model sometimes emits from training artifacts
-// Pattern: <execute_...>...</execute_...> or similar unknown tags
 static const std::vector<std::string> STRAY_OPENS  = { "<execute_" };
 static const std::vector<std::string> STRAY_CLOSES = { "</execute_" };
 
 // Gemma4 "thinking" channel — suppress internal reasoning
 static constexpr const char* THINK_OPEN    = "<|channel>thought";
-static constexpr const char* CHANNEL_NEXT  = "<|channel>";  // any following channel ends thinking
+static constexpr const char* CHANNEL_NEXT  = "<|channel>";
 
-// Find earliest occurrence of any tool-call opener; returns pos and which string matched
-static size_t find_tool_open(const std::string& s, std::string& matched) {
-    size_t best = std::string::npos;
-    for (const auto& op : TOOL_OPENS) {
-        size_t p = s.find(op);
-        if (p < best) { best = p; matched = op; }
-    }
-    return best;
+// Aliases so existing call-sites in agent.cpp compile unchanged.
+static constexpr const char* TOOL_OPEN  = TOOL_CALL_OPEN;
+static constexpr const char* TOOL_CLOSE = TOOL_CALL_CLOSE;
+
+static inline size_t find_tool_open(const std::string& s, std::string& m) {
+    return parsing_find_tool_open(s, m);
 }
-
-// Extract JSON from tool call (skips any non-JSON prefix like "call")
-static std::string extract_tool_json(const std::string& chunk,
-                                     const std::string& matched_open) {
-    size_t a = chunk.find(matched_open);
-    if (a == std::string::npos) return {};
-    size_t json_start = chunk.find('{', a + matched_open.size());
-    if (json_start == std::string::npos) return {};
-    size_t b = chunk.find(TOOL_CLOSE, json_start);
-    if (b == std::string::npos) return {};
-    return chunk.substr(json_start, b - json_start);
+static inline std::string extract_tool_json(const std::string& chunk,
+                                             const std::string& open) {
+    return parsing_extract_tool_json(chunk, open);
+}
+static inline std::string extract_between(const std::string& s,
+                                           const std::string& open,
+                                           const std::string& close) {
+    return parsing_extract_between(s, open, close);
 }
 
 // ── Tool call display (Claude Code style) ────────────────────────────────────
@@ -135,16 +122,6 @@ static std::vector<llama_token> tokenize_str(const llama_vocab* vocab,
         tokens.resize(n);
     }
     return tokens;
-}
-
-static std::string extract_between(const std::string& s,
-                                    const std::string& open,
-                                    const std::string& close) {
-    const size_t a = s.find(open);
-    if (a == std::string::npos) return {};
-    const size_t b = s.find(close, a + open.size());
-    if (b == std::string::npos) return {};
-    return s.substr(a + open.size(), b - a - open.size());
 }
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
@@ -311,21 +288,31 @@ void Agent::eval_string(const std::string& text, bool add_bos, bool parse_specia
 
 // ── Token generation ──────────────────────────────────────────────────────────
 // Streams visible text to `cb`; suppresses <tool_call>, <tool_response> blocks.
+// has_tool_turns: enables echo-hold to detect and discard JSON echoes of injected
+// tool responses (the model sometimes re-generates the response JSON verbatim).
 // Returns full generated text (with markers) and stop reason.
 std::pair<std::string, Agent::StopReason>
-Agent::generate_next(StreamCallback cb) {
+Agent::generate_next(StreamCallback cb, bool has_tool_turns) {
     // Hold back enough chars to detect any opener without splitting across pieces
     static const int HOLD = 32;
 
     std::string total;
     std::string pending;
-    std::string think_buf;    // accumulates thinking text (for nudge detection)
+    std::string think_buf;    // accumulates thinking text
     bool in_tool     = false;  // inside <tool_call>...</tool_call>
     bool in_response = false;  // inside <tool_response>...</tool_response>
     bool in_think    = false;  // inside <|channel>thought...</|channel>
-    bool in_stray    = false;  // inside stray XML block <execute_...>...</execute_...>
-    bool think_shown = false;  // emitted the "[думаю...]" header yet
-    std::string matched_open;  // which opener was detected
+    bool in_stray    = false;  // inside stray XML
+    bool think_shown = false;  // emitted "[думаю...]" header
+    std::string matched_open;
+
+    // Echo-hold: when there are prior tool turns, the model sometimes re-generates
+    // the injected {"output":...,"success":...}</tool_response> verbatim.
+    // We hold content in `pending` until we can determine whether it's an echo
+    // (starts with '{' and contains </tool_response>) or legitimate output.
+    bool in_echo_hold = has_tool_turns;
+    // Max hold before giving up and treating as real content (~largest tool output)
+    static const int ECHO_HOLD_LIMIT = 4096;
 
 
     for (int i = 0; i < cfg_.inference.max_tokens; ++i) {
@@ -351,6 +338,50 @@ Agent::generate_next(StreamCallback cb) {
         if (n <= 0) continue;
 
         pending += std::string(buf, n);
+
+        // ── echo-hold: detect and discard JSON echo of tool responses ─────
+        // Runs only while in_echo_hold=true (requires has_tool_turns=true).
+        // Uses a label so we can re-check after suppressing one echo block.
+        echo_hold_check:
+        if (in_echo_hold) {
+            const size_t fnws = pending.find_first_not_of(" \t\n\r");
+            bool still_holding = true;
+
+            if (fnws == std::string::npos) {
+                // Only whitespace accumulated — keep holding
+            } else if (pending[fnws] == '{') {
+                // Starts with '{': potential echo of injected tool response JSON
+                const size_t rc = pending.find(RESP_CLOSE);
+                if (rc != std::string::npos) {
+                    // Found </tool_response> — confirmed echo, suppress
+                    total += pending.substr(0, rc + strlen(RESP_CLOSE));
+                    pending = pending.substr(rc + strlen(RESP_CLOSE));
+                    // Stay in echo_hold: model may emit consecutive echoes
+                    goto echo_hold_check;
+                } else if ((int)pending.size() > ECHO_HOLD_LIMIT) {
+                    // Too long for an echo — treat as legitimate content
+                    in_echo_hold = false;
+                    still_holding = false;
+                }
+                // else: keep accumulating
+            } else {
+                // First non-space char is not '{' — not a JSON echo
+                in_echo_hold = false;
+                still_holding = false;
+            }
+
+            if (still_holding) {
+                // Defer all detection; only decode token and iterate
+                llama_batch decode_batch = llama_batch_get_one(&tok, 1);
+                if (llama_decode(impl_->ctx, decode_batch) != 0) {
+                    total += pending;
+                    break;
+                }
+                impl_->n_past++;
+                continue;
+            }
+            // in_echo_hold was cleared — fall through to normal processing
+        }
 
         // ── end-of-turn ───────────────────────────────────────────────────
         const size_t turn_pos = pending.find(TURN_CLOSE);
@@ -594,9 +625,15 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
         return j.dump(2);
     };
 
-    // Build prompt for the current tool-call iteration with optional nudge turn.
-    // max_resp_chars < 0 means no truncation.
-    auto build_iter_prompt = [&](int max_resp_chars, bool with_nudge) -> std::string {
+    // nudge_msg: user turn injected after tool responses to force model to continue.
+    // NUDGE_CONTINUE: model gave planning text but no tool call — ask it to keep going.
+    // NUDGE_ANALYZE:  model gave nothing — ask for written analysis.
+    static constexpr const char* NUDGE_ANALYZE  =
+        "Напиши подробный анализ на основе полученных данных.";
+    static constexpr const char* NUDGE_CONTINUE =
+        "Продолжай — вызывай следующие инструменты или дай финальный ответ.";
+
+    auto build_iter_prompt = [&](int max_resp_chars, const char* nudge_msg) -> std::string {
         std::string p = build_prompt();
         for (const auto& [gen, resp] : tool_turns) {
             p += gen;
@@ -606,36 +643,35 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
             p += std::string(TURN_CLOSE) + "\n";
             p += std::string(TURN_OPEN) + "model\n";
         }
-        if (with_nudge) {
+        if (nudge_msg) {
             p += std::string(TURN_CLOSE) + "\n";
             p += std::string(TURN_OPEN) + "user\n";
-            p += "Напиши подробный анализ на основе полученных данных.";
+            p += nudge_msg;
             p += std::string(TURN_CLOSE) + "\n";
             p += std::string(TURN_OPEN) + "model\n";
         }
-        // Always prime into response channel when there are tool turns.
-        // Prevents the model from echoing tool_response JSON or opening a
-        // thinking block before deciding what to say next.
-        if (!tool_turns.empty()) {
+        // Prime into response channel when:
+        //  - There are prior tool turns (prevents JSON echo of injected response), OR
+        //  - A nudge message is being injected (force model past thinking loop).
+        // On a clean first iteration (no tool_turns, no nudge), do NOT prime:
+        // the model needs its thinking block to plan which tools to call.
+        if (!tool_turns.empty() || nudge_msg != nullptr) {
             p += std::string(CHANNEL_NEXT) + "response\n";
         }
         return p;
     };
 
-    // Eval prompt with auto-retry on context overflow: progressively truncate
-    // tool responses until the prompt fits or all options are exhausted.
-    auto eval_with_fallback = [&](bool with_nudge) {
+    auto eval_with_fallback = [&](const char* nudge_msg) {
         constexpr int LIMITS[] = {-1, 3000, 1000, 300};
         for (int max_chars : LIMITS) {
             try {
                 llama_memory_clear(llama_get_memory(impl_->ctx), true);
                 impl_->n_past = 0;
-                eval_string(build_iter_prompt(max_chars, with_nudge), true, true);
+                eval_string(build_iter_prompt(max_chars, nudge_msg), true, true);
                 return;
             } catch (const std::runtime_error& e) {
                 if (std::string(e.what()).find("Context overflow") == std::string::npos)
                     throw;
-                // overflow — retry with smaller responses
             }
         }
         throw std::runtime_error(
@@ -643,73 +679,94 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
             "Введите /reset или уменьшите history_limit в config.json.");
     };
 
-    for (int iter = 0; iter < max_iter; ++iter) {
-        eval_with_fallback(false);
-
-        if (on_think) on_think();
-        auto [chunk, reason] = generate_next(capturing_cb);
-
-        if (reason == StopReason::Aborted) {
-            full_reply += chunk;
-            break;  // user interrupted — don't nudge, don't retry
-        }
-
-        if (reason != StopReason::ToolCall || !tools_active) {
-            full_reply += chunk;
-
-            const bool no_response = visible_reply.find_first_not_of(" \t\n\r") == std::string::npos;
-            if (no_response && !tool_turns.empty()) {
-                // Model produced no visible output after tool calls.
-                // Add an explicit nudge turn and prime the response channel
-                // so the model generates directly without a thinking block.
-                eval_with_fallback(true);
-
-                if (on_think) on_think();
-                auto [chunk2, reason2] = generate_next(capturing_cb);
-                full_reply += chunk2;
-            }
-            break;
-        }
-
-        // ── Parse tool call ───────────────────────────────────────────────
+    // Parse and execute a tool call from generated chunk; push to tool_turns.
+    // Returns false if chunk doesn't contain a valid tool call (parse error).
+    auto exec_tool = [&](const std::string& chunk) -> bool {
         std::string matched_op;
-        const size_t tool_open_pos = find_tool_open(chunk, matched_op);  // single call, reused below
+        const size_t tool_open_pos = find_tool_open(chunk, matched_op);
         const std::string call_json = matched_op.empty()
             ? extract_between(chunk, TOOL_OPEN, TOOL_CLOSE)
             : extract_tool_json(chunk, matched_op);
-        if (call_json.empty()) { full_reply += chunk; break; }
+        if (call_json.empty()) return false;
 
         nlohmann::json j = nlohmann::json::parse(call_json, nullptr, false);
-        if (j.is_discarded() || !j.contains("name")) { full_reply += chunk; break; }
+        if (j.is_discarded() || !j.contains("name")) return false;
 
         const std::string name = j["name"].get<std::string>();
         const nlohmann::json args = j.value("arguments", nlohmann::json::object());
 
-        // ── Execute ───────────────────────────────────────────────────────
         ToolResult result = active_tools().call(name, args);
-        if (cb) cb(format_tool_line(name, args, result));  // NOT through capturing_cb
+        if (cb) cb(format_tool_line(name, args, result));
 
         const std::string resp_json = nlohmann::json{
             {"success", result.success},
             {"output",  result.output}
         }.dump(2);
 
+        const std::string clean_chunk = (tool_open_pos != std::string::npos)
+            ? chunk.substr(tool_open_pos) : chunk;
+        tool_turns.emplace_back(clean_chunk, resp_json);
+        return true;
+    };
+
+    // nudged: tracks whether we've already issued a nudge since the last tool call.
+    // Prevents issuing two consecutive nudges without getting a tool call in between.
+    bool nudged = false;
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        eval_with_fallback(nullptr);
+
+        if (on_think) on_think();
+        auto [chunk, reason] = generate_next(capturing_cb, !tool_turns.empty());
+
+        if (reason == StopReason::Aborted) {
+            full_reply += chunk;
+            break;
+        }
+
+        if (reason == StopReason::ToolCall && tools_active) {
+            full_reply += chunk;
+            nudged = false;
+            if (!exec_tool(chunk)) break;
+            continue;
+        }
+
+        // Non-tool-call response (text, empty, or max-tokens).
         full_reply += chunk;
 
-        // Strip pre-tool narration: store only the <tool_call>...</tool_call> part.
-        const std::string clean_chunk = (tool_open_pos != std::string::npos)
-            ? chunk.substr(tool_open_pos)
-            : chunk;
-        tool_turns.emplace_back(clean_chunk, resp_json);
+        // Nudge only when tool calls were made but model produced NO visible text.
+        // If visible_reply has content the model intentionally stopped to respond
+        // (e.g. asking a clarifying question, or giving the final answer) — don't
+        // nudge, let that response stand.
+        const bool has_vis = visible_reply.find_first_not_of(" \t\n\r") != std::string::npos;
+        if (!nudged && !tool_turns.empty() && !has_vis) {
+            nudged = true;
+
+            eval_with_fallback(NUDGE_ANALYZE);
+            if (on_think) on_think();
+            auto [nc, nr] = generate_next(capturing_cb, !tool_turns.empty());
+            full_reply += nc;
+
+            if (nr == StopReason::ToolCall && tools_active && exec_tool(nc)) {
+                nudged = false;
+                continue;
+            }
+        }
+
+        break;
     }
 
-    // If the loop exhausted max_iterations with tool calls and never produced a visible
-    // reply, force one final generation so the user gets an answer.
-    const bool no_reply_yet = visible_reply.find_first_not_of(" \t\n\r") == std::string::npos;
-    if (no_reply_yet && !tool_turns.empty()) {
-        eval_with_fallback(true);   // rebuild prompt + nudge turn
+    // If nothing visible was produced (model only thought, or generated nothing),
+    // force a response. On zero-tool-turns case, nudge with response priming
+    // so the model actually generates the tool call instead of more thinking.
+    if (visible_reply.find_first_not_of(" \t\n\r") == std::string::npos) {
+        const char* nm = tool_turns.empty() ? NUDGE_CONTINUE : NUDGE_ANALYZE;
+        // For zero-tool-turns nudge: force into response channel via nudge path
+        // (build_iter_prompt adds priming when nudge_msg != nullptr regardless
+        // of tool_turns, so we set nudge_msg to a non-null string even if empty).
+        eval_with_fallback(nm);
         if (on_think) on_think();
-        auto [final_chunk, _] = generate_next(capturing_cb);
+        auto [final_chunk, _] = generate_next(capturing_cb, !tool_turns.empty());
         full_reply += final_chunk;
     }
 
@@ -791,6 +848,20 @@ int Agent::load_session(const std::string& path) {
         history_.erase(history_.begin() + 1, history_.begin() + 1 + excess);
         loaded -= excess;
     }
+
+    // Inject project context notes into the system message if .ai-agent/notes.md exists.
+    // The agent maintains this file itself using write_file after completing tasks.
+    const fs::path notes = fs::path(cfg_.tools.working_dir) / ".ai-agent" / "notes.md";
+    std::ifstream nf(notes);
+    if (nf.is_open()) {
+        std::string notes_content((std::istreambuf_iterator<char>(nf)),
+                                    std::istreambuf_iterator<char>());
+        if (!notes_content.empty()) {
+            history_[0].content +=
+                "\n\n## Контекст проекта (из .ai-agent/notes.md)\n" + notes_content;
+        }
+    }
+
     return loaded;
 }
 

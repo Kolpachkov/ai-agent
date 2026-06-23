@@ -34,6 +34,11 @@ public:
     void reset_history();
     void print_info() const;
 
+    // Persist/restore conversation history (skips system prompt at index 0).
+    // Returns number of turns loaded (0 if file missing or disabled).
+    int  load_history();
+    void save_history() const;
+
 private:
     struct Impl;
     Impl* impl_;

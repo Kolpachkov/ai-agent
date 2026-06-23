@@ -137,9 +137,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Restore previous session if history_file is set
+    const int restored = agent->load_history();
+
     std::cout << "\n";
     print_mode_banner(agent->mode());
-    std::cout << "  \033[2m/plan  /build  /reset  /verbose  /exit\033[0m\n\n";
+    if (restored > 0)
+        std::cout << "  \033[2m↑ восстановлено " << restored << " сообщ. из прошлой сессии\033[0m\n";
+    std::cout << "  \033[2m/plan  /build  /reset  /history  /verbose  /exit\033[0m\n\n";
 
     bool verbose_tools = false;
 
@@ -171,7 +176,15 @@ int main(int argc, char** argv) {
         }
         if (line == "/reset") {
             agent->reset_history();
+            agent->save_history();
             std::cout << "[история очищена]\n";
+            continue;
+        }
+        if (line == "/history") {
+            if (cfg.agent.history_file.empty())
+                std::cout << "[history_file не задан в config.json]\n";
+            else
+                std::cout << "[сессия: " << cfg.agent.history_file << "]\n";
             continue;
         }
         if (line == "/info") {
@@ -211,6 +224,7 @@ int main(int argc, char** argv) {
             } else {
                 std::cout << agent->chat(line) << "\n\n";
             }
+            agent->save_history();
         } catch (const std::exception& e) {
             std::cerr << "\n\033[31m  ✗ " << e.what() << "\033[0m\n";
         }

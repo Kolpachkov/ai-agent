@@ -22,8 +22,8 @@ static ToolResult tool_read_file(const nlohmann::json& args) {
     ss << f.rdbuf();
     std::string content = ss.str();
 
-    if (content.size() > 8000) {
-        content.resize(8000);
+    if (content.size() > 4000) {
+        content.resize(4000);
         content += "\n... [truncated]";
     }
     return {true, content};

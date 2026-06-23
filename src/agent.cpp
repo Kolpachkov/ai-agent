@@ -5,6 +5,7 @@
 
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -287,8 +288,8 @@ std::string Agent::build_prompt() const {
 void Agent::eval_string(const std::string& text, bool add_bos, bool parse_special) {
     auto tokens = tokenize_str(impl_->vocab, text, add_bos, parse_special);
     // Guard: n_past + incoming tokens must fit within the context window.
-    // Reserve 256 tokens for model output headroom.
-    constexpr int OUTPUT_HEADROOM = 256;
+    // Reserve 1024 tokens for model output headroom (analysis can be long).
+    constexpr int OUTPUT_HEADROOM = 1024;
     const int capacity = cfg_.model.n_ctx - OUTPUT_HEADROOM;
     if (impl_->n_past + (int)tokens.size() > capacity) {
         throw std::runtime_error(
@@ -318,47 +319,26 @@ Agent::generate_next(StreamCallback cb) {
 
     std::string total;
     std::string pending;
-    std::string think_buf;    // accumulates thinking text for fallback output
+    std::string think_buf;    // accumulates thinking text (for nudge detection)
     bool in_tool     = false;  // inside <tool_call>...</tool_call>
     bool in_response = false;  // inside <tool_response>...</tool_response>
     bool in_think    = false;  // inside <|channel>thought...</|channel>
     bool in_stray    = false;  // inside stray XML block <execute_...>...</execute_...>
-    bool think_shown = false;  // did we already print "[думаю...]"
-    bool has_visible = false;  // any actual response content sent to cb
+    bool think_shown = false;  // emitted the "[думаю...]" header yet
     std::string matched_open;  // which opener was detected
 
-    // Helper: if model stopped with no visible output, fall back to thinking content.
-    // Emits line-by-line so text appears progressively rather than as one block.
-    auto emit_fallback = [&]() {
-        if (!has_visible && cb) {
-            const std::string* text = nullptr;
-            if (in_think && !pending.empty())  text = &pending;
-            else if (!think_buf.empty())       text = &think_buf;
-            if (!text || text->empty()) return;
-
-            size_t pos = 0;
-            while (pos < text->size()) {
-                size_t nl = text->find('\n', pos);
-                if (nl == std::string::npos) nl = text->size();
-                const std::string line = text->substr(pos, nl - pos + 1);
-                if (!cb(line)) break;
-                pos = nl + 1;
-                if (pos > text->size()) break;
-            }
-        }
-    };
 
     for (int i = 0; i < cfg_.inference.max_tokens; ++i) {
         llama_token tok = llama_sampler_sample(impl_->sampler, impl_->ctx, -1);
         llama_sampler_accept(impl_->sampler, tok);
 
         if (llama_vocab_is_eog(impl_->vocab, tok)) {
-            if (!in_tool && !in_response && !in_think && cb && !pending.empty()) {
+            if (in_think) {
+                think_buf += pending;   // capture remaining thinking silently
+            } else if (!in_tool && !in_response && cb && !pending.empty()) {
                 cb(pending);
-                has_visible = true;
             }
             total += pending;
-            emit_fallback();
             return {total, StopReason::Eos};
         }
 
@@ -373,12 +353,12 @@ Agent::generate_next(StreamCallback cb) {
         const size_t turn_pos = pending.find(TURN_CLOSE);
         if (turn_pos != std::string::npos) {
             const std::string pre = pending.substr(0, turn_pos);
-            if (!in_tool && !in_response && !in_think && cb && !pre.empty()) {
+            if (in_think) {
+                think_buf += pre;       // capture remaining thinking silently
+            } else if (!in_tool && !in_response && cb && !pre.empty()) {
                 cb(pre);
-                has_visible = true;
             }
             total += pre;
-            emit_fallback();
             return {total, StopReason::EoT};
         }
 
@@ -397,23 +377,32 @@ Agent::generate_next(StreamCallback cb) {
             }
         }
 
-        // ── detect end of thinking block (next <|channel> tag) ───────────
+        // ── suppress thinking, accumulate in think_buf ────────────────────
         if (in_think) {
             if (!think_shown && cb) {
-                cb("\033[2m[думаю...]\033[0m\n");  // include newline so capturing_cb can filter the whole indicator
+                cb("\033[2m[думаю...]\033[0m\n");  // show indicator only, not content
                 think_shown = true;
             }
-            // Find the SECOND occurrence of <|channel> (the one after <|channel>thought)
+            // Detect channel switch (end of thinking block)
             const size_t next_ch = pending.find(CHANNEL_NEXT);
             if (next_ch != std::string::npos) {
-                // Save thinking text as fallback (in case no response channel content follows)
                 think_buf += pending.substr(0, next_ch);
-                // skip everything up to and including "<|channel>response" tag
+                // Skip past <|channel>xxx\n marker
                 const size_t tag_end = pending.find('\n', next_ch);
-                total += pending.substr(0, tag_end != std::string::npos ? tag_end + 1 : next_ch + std::string(CHANNEL_NEXT).size());
-                pending = pending.substr(tag_end != std::string::npos ? tag_end + 1 : next_ch + std::string(CHANNEL_NEXT).size());
+                const size_t skip_to = tag_end != std::string::npos
+                                           ? tag_end + 1
+                                           : next_ch + strlen(CHANNEL_NEXT);
+                total += pending.substr(0, skip_to);
+                pending = pending.substr(skip_to);
                 in_think = false;
-                if (cb) cb("\n");  // newline after thinking indicator
+            } else {
+                // Accumulate silently; hold enough bytes to detect <|channel>
+                constexpr int THINK_HOLD = 12;
+                const int flush_n = (int)pending.size() - THINK_HOLD;
+                if (flush_n > 0) {
+                    think_buf += pending.substr(0, flush_n);
+                    pending = pending.substr(flush_n);
+                }
             }
         }
 
@@ -424,7 +413,7 @@ Agent::generate_next(StreamCallback cb) {
                     const size_t sp = pending.find(stray_open);
                     if (sp != std::string::npos) {
                         const std::string pre = pending.substr(0, sp);
-                        if (cb && !pre.empty()) { cb(pre); has_visible = true; }
+                        if (cb && !pre.empty()) { cb(pre); }
                         total += pre;
                         pending = pending.substr(sp);
                         in_stray = true;
@@ -496,24 +485,33 @@ Agent::generate_next(StreamCallback cb) {
             const int flush_n = (int)pending.size() - HOLD;
             if (flush_n > 0) {
                 const std::string out = pending.substr(0, flush_n);
-                if (cb) { cb(out); has_visible = true; }
+                if (cb) { cb(out); }
                 total += out;
                 pending = pending.substr(flush_n);
             }
         }
 
         llama_batch next = llama_batch_get_one(&tok, 1);
-        if (llama_decode(impl_->ctx, next) != 0)
-            throw std::runtime_error("llama_decode failed during generation");
+        if (llama_decode(impl_->ctx, next) != 0) {
+            // KV cache full — stop generation cleanly instead of crashing.
+            if (in_think) {
+                think_buf += pending;   // capture silently
+            } else if (!in_tool && !in_response && cb && !pending.empty()) {
+                cb(pending);            // flush visible content so user sees partial output
+            }
+            total += pending;
+            break;
+        }
         impl_->n_past++;
     }
 
-    if (!in_tool && !in_response && !in_think && cb && !pending.empty()) {
+    // max_tokens reached — flush what we have
+    if (in_think) {
+        think_buf += pending;
+    } else if (!in_tool && !in_response && cb && !pending.empty()) {
         cb(pending);
-        has_visible = true;
     }
     total += pending;
-    emit_fallback();
     return {total, StopReason::EoT};
 }
 
@@ -527,13 +525,14 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
 
     history_.push_back({Message::Role::User, user_msg});
 
-    // Capture only visible response text (not tool mechanics) for history storage.
-    // Tool lines (⦿ ...) are sent via cb directly from chat(), so they never
-    // reach this wrapper. The thinking indicator ([думаю...]) is excluded too.
+    // Capture only response-channel text for history.
+    // Tool status lines (⦿ ...) and thinking bypass capturing_cb entirely.
+    // The "\033[2m[думаю...]\033[0m\n" indicator is filtered so it doesn't
+    // accumulate in visible_reply.
     static const std::string THINK_IND = "\033[2m[думаю...]\033[0m\n";
     std::string visible_reply;
     StreamCallback capturing_cb = [&](const std::string& piece) -> bool {
-        if (piece != THINK_IND)   // filter only the think indicator (with its newline)
+        if (piece != THINK_IND)
             visible_reply += piece;
         return cb ? cb(piece) : true;
     };
@@ -548,21 +547,65 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
     //   .second = tool result JSON
     std::vector<std::pair<std::string,std::string>> tool_turns;
 
-    for (int iter = 0; iter < max_iter; ++iter) {
-        // ── Rebuild prompt from scratch with proper turn structure ─────────
-        std::string current_prompt = build_prompt();  // ends with <|turn>model\n
-        for (const auto& [generated, response] : tool_turns) {
-            current_prompt += generated;
-            current_prompt += std::string(TURN_CLOSE) + "\n";
-            current_prompt += std::string(TURN_OPEN) + "user\n";
-            current_prompt += "<tool_response>\n" + response + "\n</tool_response>";
-            current_prompt += std::string(TURN_CLOSE) + "\n";
-            current_prompt += std::string(TURN_OPEN) + "model\n";
+    // Truncate "output" field in a tool-response JSON to at most max_chars.
+    auto trim_resp = [](const std::string& resp_json, int max_chars) -> std::string {
+        if (max_chars < 0) return resp_json;
+        auto j = nlohmann::json::parse(resp_json, nullptr, false);
+        if (j.is_discarded()) return resp_json;
+        std::string out = j.value("output", "");
+        if ((int)out.size() > max_chars) {
+            j["output"]    = out.substr(0, max_chars) + "\n... [урезано]";
+            j["truncated"] = true;
         }
+        return j.dump(2);
+    };
 
-        llama_memory_clear(llama_get_memory(impl_->ctx), true);
-        impl_->n_past = 0;
-        eval_string(current_prompt, true, true);
+    // Build prompt for the current tool-call iteration with optional nudge turn.
+    // max_resp_chars < 0 means no truncation.
+    auto build_iter_prompt = [&](int max_resp_chars, bool with_nudge) -> std::string {
+        std::string p = build_prompt();
+        for (const auto& [gen, resp] : tool_turns) {
+            p += gen;
+            p += std::string(TURN_CLOSE) + "\n";
+            p += std::string(TURN_OPEN) + "user\n";
+            p += "<tool_response>\n" + trim_resp(resp, max_resp_chars) + "\n</tool_response>";
+            p += std::string(TURN_CLOSE) + "\n";
+            p += std::string(TURN_OPEN) + "model\n";
+        }
+        if (with_nudge) {
+            p += std::string(TURN_CLOSE) + "\n";
+            p += std::string(TURN_OPEN) + "user\n";
+            p += "Напиши подробный анализ на основе полученных данных.";
+            p += std::string(TURN_CLOSE) + "\n";
+            p += std::string(TURN_OPEN) + "model\n";
+            p += std::string(CHANNEL_NEXT) + "response\n";
+        }
+        return p;
+    };
+
+    // Eval prompt with auto-retry on context overflow: progressively truncate
+    // tool responses until the prompt fits or all options are exhausted.
+    auto eval_with_fallback = [&](bool with_nudge) {
+        constexpr int LIMITS[] = {-1, 3000, 1000, 300};
+        for (int max_chars : LIMITS) {
+            try {
+                llama_memory_clear(llama_get_memory(impl_->ctx), true);
+                impl_->n_past = 0;
+                eval_string(build_iter_prompt(max_chars, with_nudge), true, true);
+                return;
+            } catch (const std::runtime_error& e) {
+                if (std::string(e.what()).find("Context overflow") == std::string::npos)
+                    throw;
+                // overflow — retry with smaller responses
+            }
+        }
+        throw std::runtime_error(
+            "Контекст переполнен даже с минимальными ответами инструментов. "
+            "Введите /reset или уменьшите history_limit в config.json.");
+    };
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        eval_with_fallback(false);
 
         if (on_think) on_think();
         auto [chunk, reason] = generate_next(capturing_cb);
@@ -572,29 +615,14 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
 
             // If model produced no visible text after tool calls, retry with an
             // explicit nudge user-turn so it knows to write the final response.
-            if (visible_reply.empty() && !tool_turns.empty()) {
-                std::string nudge_prompt = build_prompt();
-                for (const auto& [gen, resp] : tool_turns) {
-                    nudge_prompt += gen;
-                    nudge_prompt += std::string(TURN_CLOSE) + "\n";
-                    nudge_prompt += std::string(TURN_OPEN) + "user\n";
-                    nudge_prompt += "<tool_response>\n" + resp + "\n</tool_response>";
-                    nudge_prompt += std::string(TURN_CLOSE) + "\n";
-                    nudge_prompt += std::string(TURN_OPEN) + "model\n";
-                }
-                // Close last model turn, add nudge, open new model turn,
-                // then prime the response channel so model generates directly
-                // without entering a thinking block (enabling true streaming).
-                nudge_prompt += std::string(TURN_CLOSE) + "\n";
-                nudge_prompt += std::string(TURN_OPEN) + "user\n";
-                nudge_prompt += "Напиши подробный анализ на основе полученных данных.";
-                nudge_prompt += std::string(TURN_CLOSE) + "\n";
-                nudge_prompt += std::string(TURN_OPEN) + "model\n";
-                nudge_prompt += std::string(CHANNEL_NEXT) + "response\n";
-
-                llama_memory_clear(llama_get_memory(impl_->ctx), true);
-                impl_->n_past = 0;
-                eval_string(nudge_prompt, true, true);
+            // Trigger nudge when no response-channel content was produced.
+            // visible_reply may contain whitespace from dim-reset sequences — check trimmed.
+            const bool no_response = visible_reply.find_first_not_of(" \t\n\r") == std::string::npos;
+            if (no_response && !tool_turns.empty()) {
+                // Model produced no visible output after tool calls.
+                // Add an explicit nudge turn and prime the response channel
+                // so the model generates directly without a thinking block.
+                eval_with_fallback(true);
 
                 if (on_think) on_think();
                 auto [chunk2, reason2] = generate_next(capturing_cb);
@@ -635,10 +663,22 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
         tool_turns.emplace_back(clean_chunk, resp_json);
     }
 
-    // Store only the visible response in history (not raw tool-call mechanics).
-    // This keeps context small across turns.
-    history_.push_back({Message::Role::Assistant,
-                        visible_reply.empty() ? full_reply : visible_reply});
+    // If the loop exhausted max_iterations with tool calls and never produced a visible
+    // reply, force one final generation so the user gets an answer.
+    const bool no_reply_yet = visible_reply.find_first_not_of(" \t\n\r") == std::string::npos;
+    if (no_reply_yet && !tool_turns.empty()) {
+        eval_with_fallback(true);   // rebuild prompt + nudge turn
+        if (on_think) on_think();
+        auto [final_chunk, _] = generate_next(capturing_cb);
+        full_reply += final_chunk;
+    }
+
+    // Store only response-channel content in history (no thinking, no tool mechanics).
+    // visible_reply contains only non-think, non-tool text from capturing_cb.
+    // Fallback to full_reply if visible_reply is whitespace-only.
+    const bool has_reply = visible_reply.find_first_not_of(" \t\n\r") != std::string::npos;
+    const std::string history_content = has_reply ? visible_reply : full_reply;
+    history_.push_back(Message{Message::Role::Assistant, history_content});
     return full_reply;
 }
 
@@ -660,4 +700,76 @@ void Agent::print_info() const {
               << "[agent] ctx_active: " << llama_n_ctx(impl_->ctx)             << "\n"
               << "[agent] gpu_layers: " << cfg_.model.n_gpu_layers              << "\n"
               << "[agent] tools:      " << (cfg_.tools.enabled ? "on" : "off")  << "\n";
+}
+
+// ── Session persistence ───────────────────────────────────────────────────────
+
+static std::string expand_home(const std::string& path) {
+    if (path.empty() || path[0] != '~') return path;
+    const char* home = getenv("HOME");
+    return home ? std::string(home) + path.substr(1) : path;
+}
+
+static const char* role_str(Message::Role r) {
+    switch (r) {
+        case Message::Role::System:    return "system";
+        case Message::Role::User:      return "user";
+        case Message::Role::Assistant: return "assistant";
+    }
+    return "user";
+}
+
+static Message::Role role_from_str(const std::string& s) {
+    if (s == "system")    return Message::Role::System;
+    if (s == "assistant") return Message::Role::Assistant;
+    return Message::Role::User;
+}
+
+int Agent::load_history() {
+    if (cfg_.agent.history_file.empty()) return 0;
+    const std::string path = expand_home(cfg_.agent.history_file);
+    std::ifstream f(path);
+    if (!f.is_open()) return 0;
+
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(f); }
+    catch (...) { return 0; }
+
+    if (!j.is_array()) return 0;
+
+    int loaded = 0;
+    for (const auto& item : j) {
+        if (!item.contains("role") || !item.contains("content")) continue;
+        const auto role    = role_from_str(item["role"].get<std::string>());
+        const auto content = item["content"].get<std::string>();
+        if (role == Message::Role::System) continue;  // always rebuilt from config
+        history_.push_back({role, content});
+        ++loaded;
+    }
+
+    // Respect history_limit (keep system prompt at index 0)
+    if ((int)history_.size() > cfg_.agent.history_limit + 1) {
+        const int excess = (int)history_.size() - (cfg_.agent.history_limit + 1);
+        history_.erase(history_.begin() + 1, history_.begin() + 1 + excess);
+        loaded -= excess;
+    }
+    return loaded;
+}
+
+void Agent::save_history() const {
+    if (cfg_.agent.history_file.empty()) return;
+    const std::string path = expand_home(cfg_.agent.history_file);
+
+    // Ensure parent directory exists
+    std::error_code ec;
+    fs::create_directories(fs::path(path).parent_path(), ec);
+
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& msg : history_) {
+        if (msg.role == Message::Role::System) continue;  // don't persist system prompt
+        arr.push_back({{"role", role_str(msg.role)}, {"content", msg.content}});
+    }
+
+    std::ofstream f(path);
+    if (f.is_open()) f << arr.dump(2);
 }

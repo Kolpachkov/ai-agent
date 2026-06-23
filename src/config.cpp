@@ -57,6 +57,7 @@ static void parse_agent(const json& j, AgentConfig& a) {
     if (j.contains("stream"))              a.stream              = j["stream"].get<bool>();
     if (j.contains("verbose"))             a.verbose             = j["verbose"].get<bool>();
     if (j.contains("history_limit"))       a.history_limit       = j["history_limit"].get<int>();
+    if (j.contains("history_file"))        a.history_file        = j["history_file"].get<std::string>();
     if (j.contains("plan_system_prompt"))  a.plan_system_prompt  = j["plan_system_prompt"].get<std::string>();
     if (j.contains("build_system_prompt")) a.build_system_prompt = j["build_system_prompt"].get<std::string>();
 }

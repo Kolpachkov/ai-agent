@@ -334,9 +334,12 @@ Agent::generate_next(StreamCallback cb) {
 
         if (llama_vocab_is_eog(impl_->vocab, tok)) {
             if (in_think) {
-                think_buf += pending;   // capture remaining thinking silently
-            } else if (!in_tool && !in_response && cb && !pending.empty()) {
-                cb(pending);
+                think_buf += pending;
+            } else if (!in_tool && !in_response && !pending.empty()) {
+                if (cb && !cb(pending)) {
+                    total += pending;
+                    return {total, StopReason::Aborted};
+                }
             }
             total += pending;
             return {total, StopReason::Eos};
@@ -354,9 +357,12 @@ Agent::generate_next(StreamCallback cb) {
         if (turn_pos != std::string::npos) {
             const std::string pre = pending.substr(0, turn_pos);
             if (in_think) {
-                think_buf += pre;       // capture remaining thinking silently
-            } else if (!in_tool && !in_response && cb && !pre.empty()) {
-                cb(pre);
+                think_buf += pre;
+            } else if (!in_tool && !in_response && !pre.empty()) {
+                if (cb && !cb(pre)) {
+                    total += pre;
+                    return {total, StopReason::Aborted};
+                }
             }
             total += pre;
             return {total, StopReason::EoT};
@@ -369,8 +375,13 @@ Agent::generate_next(StreamCallback cb) {
             const size_t tpos = pending.find(THINK_OPEN);
             if (tpos != std::string::npos) {
                 const std::string pre = pending.substr(0, tpos);
-                if (cb && !pre.empty()) cb(pre);
-                total += pre;
+                if (!pre.empty()) {
+                    if (cb && !cb(pre)) {
+                        total += pre;
+                        return {total, StopReason::Aborted};
+                    }
+                    total += pre;
+                }
                 pending = pending.substr(tpos + std::string(THINK_OPEN).size());
                 in_think = true;
                 think_shown = false;
@@ -413,8 +424,13 @@ Agent::generate_next(StreamCallback cb) {
                     const size_t sp = pending.find(stray_open);
                     if (sp != std::string::npos) {
                         const std::string pre = pending.substr(0, sp);
-                        if (cb && !pre.empty()) { cb(pre); }
-                        total += pre;
+                        if (!pre.empty()) {
+                            if (cb && !cb(pre)) {
+                                total += pre;
+                                return {total, StopReason::Aborted};
+                            }
+                            total += pre;
+                        }
                         pending = pending.substr(sp);
                         in_stray = true;
                         break;
@@ -440,8 +456,13 @@ Agent::generate_next(StreamCallback cb) {
                 size_t open_pos = find_tool_open(pending, matched_open);
                 if (open_pos != std::string::npos) {
                     const std::string pre = pending.substr(0, open_pos);
-                    if (cb && !pre.empty()) cb(pre);
-                    total += pre;
+                    if (!pre.empty()) {
+                        if (cb && !cb(pre)) {
+                            total += pre;
+                            return {total, StopReason::Aborted};
+                        }
+                        total += pre;
+                    }
                     pending = pending.substr(open_pos);
                     in_tool = true;
                 }
@@ -452,8 +473,13 @@ Agent::generate_next(StreamCallback cb) {
                 const size_t ropen_pos = pending.find(RESP_OPEN);
                 if (ropen_pos != std::string::npos) {
                     const std::string pre = pending.substr(0, ropen_pos);
-                    if (cb && !pre.empty()) cb(pre);
-                    total += pre;
+                    if (!pre.empty()) {
+                        if (cb && !cb(pre)) {
+                            total += pre;
+                            return {total, StopReason::Aborted};
+                        }
+                        total += pre;
+                    }
                     pending = pending.substr(ropen_pos);
                     in_response = true;
                 }
@@ -485,7 +511,12 @@ Agent::generate_next(StreamCallback cb) {
             const int flush_n = (int)pending.size() - HOLD;
             if (flush_n > 0) {
                 const std::string out = pending.substr(0, flush_n);
-                if (cb) { cb(out); }
+                if (cb && !cb(out)) {
+                    total += out;
+                    pending = pending.substr(flush_n);
+                    total += pending;
+                    return {total, StopReason::Aborted};
+                }
                 total += out;
                 pending = pending.substr(flush_n);
             }
@@ -493,11 +524,11 @@ Agent::generate_next(StreamCallback cb) {
 
         llama_batch next = llama_batch_get_one(&tok, 1);
         if (llama_decode(impl_->ctx, next) != 0) {
-            // KV cache full — stop generation cleanly instead of crashing.
+            // KV cache full — stop cleanly.
             if (in_think) {
-                think_buf += pending;   // capture silently
-            } else if (!in_tool && !in_response && cb && !pending.empty()) {
-                cb(pending);            // flush visible content so user sees partial output
+                think_buf += pending;
+            } else if (!in_tool && !in_response && !pending.empty()) {
+                if (cb && !cb(pending))  { total += pending; return {total, StopReason::Aborted}; }
             }
             total += pending;
             break;
@@ -505,11 +536,14 @@ Agent::generate_next(StreamCallback cb) {
         impl_->n_past++;
     }
 
-    // max_tokens reached — flush what we have
+    // max_tokens reached (or KV break) — flush what we have
     if (in_think) {
         think_buf += pending;
-    } else if (!in_tool && !in_response && cb && !pending.empty()) {
-        cb(pending);
+    } else if (!in_tool && !in_response && !pending.empty()) {
+        if (cb && !cb(pending)) {
+            total += pending;
+            return {total, StopReason::Aborted};
+        }
     }
     total += pending;
     return {total, StopReason::EoT};
@@ -578,6 +612,11 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
             p += "Напиши подробный анализ на основе полученных данных.";
             p += std::string(TURN_CLOSE) + "\n";
             p += std::string(TURN_OPEN) + "model\n";
+        }
+        // Always prime into response channel when there are tool turns.
+        // Prevents the model from echoing tool_response JSON or opening a
+        // thinking block before deciding what to say next.
+        if (!tool_turns.empty()) {
             p += std::string(CHANNEL_NEXT) + "response\n";
         }
         return p;
@@ -610,13 +649,14 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
         if (on_think) on_think();
         auto [chunk, reason] = generate_next(capturing_cb);
 
+        if (reason == StopReason::Aborted) {
+            full_reply += chunk;
+            break;  // user interrupted — don't nudge, don't retry
+        }
+
         if (reason != StopReason::ToolCall || !tools_active) {
             full_reply += chunk;
 
-            // If model produced no visible text after tool calls, retry with an
-            // explicit nudge user-turn so it knows to write the final response.
-            // Trigger nudge when no response-channel content was produced.
-            // visible_reply may contain whitespace from dim-reset sequences — check trimmed.
             const bool no_response = visible_reply.find_first_not_of(" \t\n\r") == std::string::npos;
             if (no_response && !tool_turns.empty()) {
                 // Model produced no visible output after tool calls.
@@ -725,9 +765,8 @@ static Message::Role role_from_str(const std::string& s) {
     return Message::Role::User;
 }
 
-int Agent::load_history() {
-    if (cfg_.agent.history_file.empty()) return 0;
-    const std::string path = expand_home(cfg_.agent.history_file);
+int Agent::load_session(const std::string& path) {
+    if (path.empty()) return 0;
     std::ifstream f(path);
     if (!f.is_open()) return 0;
 
@@ -742,12 +781,11 @@ int Agent::load_history() {
         if (!item.contains("role") || !item.contains("content")) continue;
         const auto role    = role_from_str(item["role"].get<std::string>());
         const auto content = item["content"].get<std::string>();
-        if (role == Message::Role::System) continue;  // always rebuilt from config
+        if (role == Message::Role::System) continue;
         history_.push_back({role, content});
         ++loaded;
     }
 
-    // Respect history_limit (keep system prompt at index 0)
     if ((int)history_.size() > cfg_.agent.history_limit + 1) {
         const int excess = (int)history_.size() - (cfg_.agent.history_limit + 1);
         history_.erase(history_.begin() + 1, history_.begin() + 1 + excess);
@@ -756,20 +794,26 @@ int Agent::load_history() {
     return loaded;
 }
 
-void Agent::save_history() const {
-    if (cfg_.agent.history_file.empty()) return;
-    const std::string path = expand_home(cfg_.agent.history_file);
+void Agent::set_session_path(const std::string& path) {
+    session_path_ = path;
+}
 
-    // Ensure parent directory exists
+std::string Agent::current_session_path() const {
+    return session_path_;
+}
+
+void Agent::save_history() const {
+    if (session_path_.empty()) return;
+
     std::error_code ec;
-    fs::create_directories(fs::path(path).parent_path(), ec);
+    fs::create_directories(fs::path(session_path_).parent_path(), ec);
 
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& msg : history_) {
-        if (msg.role == Message::Role::System) continue;  // don't persist system prompt
+        if (msg.role == Message::Role::System) continue;
         arr.push_back({{"role", role_str(msg.role)}, {"content", msg.content}});
     }
 
-    std::ofstream f(path);
+    std::ofstream f(session_path_);
     if (f.is_open()) f << arr.dump(2);
 }

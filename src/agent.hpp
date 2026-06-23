@@ -34,16 +34,22 @@ public:
     void reset_history();
     void print_info() const;
 
-    // Persist/restore conversation history (skips system prompt at index 0).
-    // Returns number of turns loaded (0 if file missing or disabled).
-    int  load_history();
-    void save_history() const;
+    // Session persistence.
+    // load_session: load from an explicit file path; returns messages loaded.
+    // set_session_path: called by main to tell agent where to save (before first turn).
+    // save_history: write to current session path (no-op if path is empty).
+    int         load_session(const std::string& path);
+    void        set_session_path(const std::string& path);
+    std::string current_session_path() const;
+    void        save_history() const;
 
 private:
     struct Impl;
     Impl* impl_;
 
-    enum class StopReason { EoT, Eos, ToolCall };
+    enum class StopReason { EoT, Eos, ToolCall, Aborted };
+
+    std::string session_path_;
 
     std::string build_prompt() const;
     std::string active_system_prompt() const;

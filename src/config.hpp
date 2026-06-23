@@ -33,7 +33,7 @@ struct AgentConfig {
     bool        stream        = true;
     bool        verbose       = false;
     int         history_limit = 20;
-    std::string history_file  = "";   // "" = disabled, path to JSON session file
+    std::string sessions_dir  = "";   // "" = disabled; dir where named session .json files live
 
     // Per-mode system prompts (set in config.json)
     std::string plan_system_prompt =

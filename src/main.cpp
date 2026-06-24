@@ -43,6 +43,7 @@ static int               g_spinner_frame{0};
 static int               g_scroll_top{-1};   // -1 = auto, >= 0 = frozen line
 
 static void handle_sigwinch(int) { g_resize_pending = true; }
+static void handle_sigint(int)   { g_interrupted = true; }
 
 // ── Thread-safe output buffer ─────────────────────────────────────────────────
 static std::mutex              g_out_mu;
@@ -455,18 +456,51 @@ static std::vector<SessionEntry> scan_sessions(const std::string& dir_raw) {
     return out;
 }
 
+// ── Display loaded session history in output window ───────────────────────────
+static void display_session_history(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return;
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(f); } catch(...) { return; }
+    if (!j.is_array() || j.empty()) return;
+
+    out_push("\n  ─── история сессии ───\n\n");
+    for (const auto& msg : j) {
+        const std::string role    = msg.value("role","");
+        const std::string content = msg.value("content","");
+        if (role == "system") continue;
+        if (role == "user") {
+            // Show first line of user message only
+            const auto nl = content.find('\n');
+            const std::string first = nl == std::string::npos ? content : content.substr(0,nl);
+            out_push("◆ > " + (first.size()>80 ? first.substr(0,77)+"…" : first) + "\n");
+        } else if (role == "assistant") {
+            // Show first 4 lines of assistant reply
+            std::istringstream ss(content);
+            std::string line; int shown=0;
+            while (std::getline(ss,line) && shown<4) {
+                if (!line.empty()) { out_push("  " + line + "\n"); ++shown; }
+            }
+            if (ss.peek() != EOF) out_push("  …\n");
+        }
+        out_push("\n");
+    }
+    out_push("  ─── конец истории ───\n\n");
+}
+
 // ── Session selection (runs inside TUI) ───────────────────────────────────────
 static int tui_pick_session(const std::vector<SessionEntry>& sessions) {
-    std::string s = "\n  Sessions — choose to load, or Enter for new:\n";
-    s += "  [0]  new session\n";
+    std::string s = "\n  ╔══ Сессии ══════════════════════════════════════════════╗\n";
+    s += "  ║  [0]  новая сессия                                     ║\n";
     for (int i=0; i<(int)sessions.size(); ++i) {
         char buf[300];
-        snprintf(buf,sizeof(buf),"  [%d]  %-50s  (%d msg)",
+        snprintf(buf,sizeof(buf),"  ║  [%d]  %-48s  (%2d) ║",
                  i+1, sessions[i].title.c_str(), sessions[i].count);
         s += std::string(buf)+"\n";
     }
+    s += "  ╚═════════════════════════════════════════════════════════╝\n";
     out_push(s);
-    const std::string ans = read_line_tui("  > ");
+    const std::string ans = read_line_tui("  номер или Enter для новой: ");
     out_push("\n");
     if (ans.empty()) return 0;
     try {
@@ -628,17 +662,23 @@ int main(int argc, char** argv) {
     flush_output();
     draw_input(inp);
 
+    std::signal(SIGINT, handle_sigint);
+
     // ── TUI: session selection ────────────────────────────────────────────────
     if (!cfg.agent.sessions_dir.empty()) {
         const auto sessions = scan_sessions(cfg.agent.sessions_dir);
         if (!sessions.empty()) {
             draw_header(agent->mode(), model_name);
             const int choice = tui_pick_session(sessions);
+            // Clear selection menu from output, then show history or new-session banner
+            { std::lock_guard<std::mutex> lk(g_out_mu); g_lines.clear(); g_dirty=true; }
             if (choice>0 && choice<=(int)sessions.size()) {
                 agent->set_session_path(sessions[choice-1].path);
                 agent->load_session(sessions[choice-1].path);
                 session_named = true;
-                out_push("  ↑ session loaded ("+std::to_string(sessions[choice-1].count)+" messages)\n");
+                display_session_history(sessions[choice-1].path);
+            } else {
+                out_push("\n  [новая сессия]\n\n");
             }
         }
     }

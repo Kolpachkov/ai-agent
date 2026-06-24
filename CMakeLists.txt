@@ -21,13 +21,14 @@ add_executable(ai-agent
 
 target_include_directories(ai-agent PRIVATE src/)
 
-find_library(READLINE_LIB readline REQUIRED)
+find_package(Curses REQUIRED)
 
 target_link_libraries(ai-agent PRIVATE
     llama
     nlohmann_json::nlohmann_json
-    ${READLINE_LIB}
+    ${CURSES_LIBRARIES}
 )
+target_include_directories(ai-agent PRIVATE ${CURSES_INCLUDE_DIRS})
 
 target_compile_options(ai-agent PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-O3 -march=native -Wall -Wextra>

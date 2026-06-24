@@ -2,441 +2,782 @@
 #include "config.hpp"
 
 #include <nlohmann/json.hpp>
+#include <ncurses.h>
+#include <locale.h>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <memory>
+#include <fstream>
 #include <sstream>
 #include <string>
-#include <csignal>
-#include <cstdlib>
-#include <ctime>
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <deque>
+#include <vector>
 #include <chrono>
-#include <readline/readline.h>
-#include <readline/history.h>
+#include <csignal>
+#include <cstdlib>
+#include <memory>
 
 namespace fs = std::filesystem;
 
-static volatile sig_atomic_t g_interrupted = 0;
-static void handle_signal(int) { g_interrupted = 1; }
+// ── Color pairs (Gruvbox dark) ────────────────────────────────────────────────
+static constexpr int CP_HEADER = 1;
+static constexpr int CP_USER   = 2;
+static constexpr int CP_RESP   = 3;
+static constexpr int CP_TOOL   = 4;
+static constexpr int CP_THINK  = 5;
+static constexpr int CP_STATUS = 6;
+static constexpr int CP_ERROR  = 7;
+static constexpr int CP_DIM    = 8;
 
-// ── Spinner ───────────────────────────────────────────────────────────────────
-class Spinner {
-    std::thread         th_;
-    std::atomic<bool>   running_{false};
-public:
-    void start() {
-        stop();
-        running_ = true;
-        th_ = std::thread([this] {
-            static const char* F[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
-            int i = 0;
-            while (running_) {
-                fprintf(stderr, "\r\033[2m%s\033[0m ", F[i++ % 10]);
-                fflush(stderr);
-                std::this_thread::sleep_for(std::chrono::milliseconds(80));
-            }
-            fprintf(stderr, "\r\033[K");
-            fflush(stderr);
-        });
+static const char* SPINNER[]   = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+static constexpr int SPINNER_N = 10;
+static constexpr int OUT_PAD   = 4;
+
+// ── Global state ──────────────────────────────────────────────────────────────
+static std::atomic<bool> g_interrupted{false};
+static std::atomic<bool> g_generating{false};
+static std::atomic<bool> g_resize_pending{false};
+static int               g_spinner_frame{0};
+static int               g_scroll_top{-1};   // -1 = auto, >= 0 = frozen line
+
+static void handle_sigwinch(int) { g_resize_pending = true; }
+
+// ── Thread-safe output buffer ─────────────────────────────────────────────────
+static std::mutex              g_out_mu;
+static std::deque<std::string> g_lines;
+static bool                    g_dirty{false};
+
+static void out_push(const std::string& text) {
+    std::lock_guard<std::mutex> lk(g_out_mu);
+    if (g_lines.empty()) g_lines.push_back("");
+    for (char c : text) {
+        if (c == '\n') g_lines.push_back("");
+        else           g_lines.back() += c;
     }
-    void stop() {
-        if (!running_) return;
-        running_ = false;
-        if (th_.joinable()) th_.join();
+    g_dirty = true;
+}
+
+// ── UTF-8 helpers ─────────────────────────────────────────────────────────────
+static std::string strip_ansi(const std::string& s) {
+    std::string r; bool esc = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (esc) { if ((s[i]>='A'&&s[i]<='Z')||(s[i]>='a'&&s[i]<='z')) esc=false; }
+        else if (s[i]=='\033' && i+1<s.size() && s[i+1]=='[') { esc=true; ++i; }
+        else r += s[i];
     }
-    ~Spinner() { stop(); }
+    return r;
+}
+
+static int utf8_cols(const std::string& s) {
+    int c = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char b = (unsigned char)s[i];
+        if      (b < 0x80) { c++; i++;    }
+        else if (b < 0xE0) { c++; i += 2; }
+        else if (b < 0xF0) { c++; i += 3; }
+        else               { c++; i += 4; }
+    }
+    return c;
+}
+
+// Bytes in s[0..len) that fit within max_cols display columns
+static int bytes_for_cols(const char* s, int len, int max_cols) {
+    int cols = 0, i = 0;
+    while (i < len) {
+        if (cols >= max_cols) return i;
+        const unsigned char c = (unsigned char)s[i];
+        const int step = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+        if (i + step > len) return i;
+        i += step; cols++;
+    }
+    return i;
+}
+
+
+// ── Per-line color pair ───────────────────────────────────────────────────────
+static int line_cp(const std::string& line) {
+    if (line.empty()) return 0;
+    auto sw = [&](const char* p){ return line.find(p) == 0; };
+    if (sw("◆ >"))       return CP_USER;
+    if (sw("  ╰─"))      return CP_DIM;
+    if (sw("  ↑"))       return CP_DIM;
+    if (sw("  ⦿"))       return CP_TOOL;
+    if (sw("  ✓"))       return CP_TOOL;
+    if (sw("  ✗"))       return CP_ERROR;
+    if (sw("[thinking"))  return CP_THINK;
+    if (sw("[error"))     return CP_ERROR;
+    if (sw("[inter") || sw("[busy")) return CP_DIM;
+    if (sw("[mode")  || sw("[history") || sw("[model")
+     || sw("[verbose")|| sw("[loading")|| sw("[session")
+     || sw("[current")|| sw("[mouse")  || sw("  ↑ session")) return CP_STATUS;
+    return CP_RESP;
+}
+
+// ── Gruvbox color init ────────────────────────────────────────────────────────
+static void init_colors() {
+    if (!has_colors()) return;
+    if (COLORS >= 256) {
+        init_pair(CP_HEADER, 235, 214);
+        init_pair(CP_USER,   214, -1);
+        init_pair(CP_RESP,   223, -1);
+        init_pair(CP_TOOL,   108, -1);
+        init_pair(CP_THINK,  175, -1);
+        init_pair(CP_STATUS, 142, -1);
+        init_pair(CP_ERROR,  167, -1);
+        init_pair(CP_DIM,    245, -1);
+    } else {
+        init_pair(CP_HEADER, COLOR_BLACK,  COLOR_YELLOW);
+        init_pair(CP_USER,   COLOR_YELLOW, -1);
+        init_pair(CP_RESP,   -1,           -1);
+        init_pair(CP_TOOL,   COLOR_GREEN,  -1);
+        init_pair(CP_THINK,  COLOR_CYAN,   -1);
+        init_pair(CP_STATUS, COLOR_GREEN,  -1);
+        init_pair(CP_ERROR,  COLOR_RED,    -1);
+        init_pair(CP_DIM,    COLOR_WHITE,  -1);
+    }
+}
+
+// ── Strip markdown ────────────────────────────────────────────────────────────
+static std::string strip_md(const std::string& line) {
+    std::string r; r.reserve(line.size());
+    for (size_t i = 0; i < line.size(); ) {
+        const unsigned char c = (unsigned char)line[i];
+        if (c == '`' && i+2 < line.size() && line[i+1]=='`' && line[i+2]=='`') { i+=3; continue; }
+        if (c == '*' && i+1 < line.size() && line[i+1]=='*') {
+            i += (i+2 < line.size() && line[i+2]=='*') ? 3 : 2; continue;
+        }
+        if (c == '*' || c == '_') {
+            const bool lw = i>0 && (std::isalnum((unsigned char)line[i-1]) || (unsigned char)line[i-1]>127);
+            const bool rw = i+1<line.size() && (std::isalnum((unsigned char)line[i+1]) || (unsigned char)line[i+1]>127);
+            if (!lw || !rw) { i++; continue; }
+        }
+        if (c == '`') { i++; continue; }
+        const size_t step = (c<0x80)?1:(c<0xE0)?2:(c<0xF0)?3:4;
+        for (size_t j=0; j<step && i<line.size(); ++j) r += line[i++];
+    }
+    size_t h = 0;
+    while (h < r.size() && r[h]=='#') h++;
+    if (h>0 && h<r.size() && r[h]==' ') r = r.substr(h+1);
+    if (!r.empty() && r[0]=='>' && (r.size()<2 || r[1]==' '))
+        r = r.substr(r.size()>1 ? 2 : 1);
+    return r;
+}
+
+// ── ncurses windows ───────────────────────────────────────────────────────────
+static WINDOW* g_hdr = nullptr;
+static WINDOW* g_out = nullptr;
+static WINDOW* g_inp = nullptr;
+static int     g_out_h = 0;
+
+static void create_windows() {
+    g_out_h = LINES - 2;
+    if (g_out_h < 1) g_out_h = 1;
+    g_hdr = newwin(1, COLS, 0, 0);
+    g_out = newwin(g_out_h, COLS, 1, 0);
+    g_inp = newwin(1, COLS, LINES-1, 0);
+    wtimeout(g_inp, 80);
+    keypad(g_inp, TRUE);
+}
+static void destroy_windows() {
+    if (g_hdr) { delwin(g_hdr); g_hdr=nullptr; }
+    if (g_out) { delwin(g_out); g_out=nullptr; }
+    if (g_inp) { delwin(g_inp); g_inp=nullptr; }
+}
+static void resize_windows() {
+    destroy_windows(); resizeterm(0,0); endwin(); refresh();
+    create_windows(); g_dirty = true;
+}
+
+static void draw_header(AgentMode mode, const std::string& model_name) {
+    if (!g_hdr) return;
+    werase(g_hdr);
+    const attr_t ha = (has_colors() ? COLOR_PAIR(CP_HEADER) : A_REVERSE) | A_BOLD;
+    wbkgd(g_hdr, ha); wattron(g_hdr, ha);
+    const char* ms = (mode == AgentMode::Plan) ? "PLAN" : "BUILD";
+    std::string spin = g_generating ? std::string(" ")+SPINNER[g_spinner_frame%SPINNER_N] : "";
+    std::string stag = (g_scroll_top >= 0) ? " [↑]" : "";
+    std::string left = " ◆ ai-agent  |  " + std::string(ms) + spin + stag + "  |  " + model_name;
+    const std::string right = " Shift+drag: copy  PgUp/Dn: scroll  ESC: stop ";
+    const int pad = COLS - utf8_cols(left) - utf8_cols(right);
+    for (int i=0; i<pad; ++i) left += ' ';
+    left += right;
+    mvwaddstr(g_hdr, 0, 0, left.c_str());
+    wattroff(g_hdr, ha); wrefresh(g_hdr);
+}
+
+// ── flush_output with word-wrap ───────────────────────────────────────────────
+static void flush_output() {
+    if (!g_out) return;
+    std::lock_guard<std::mutex> lk(g_out_mu);
+    if (!g_dirty) return;
+
+    const int total = (int)g_lines.size();
+    const int cw    = std::max(1, COLS - 2*OUT_PAD);
+
+    // Pre-render lines and compute visual row count
+    auto rendered = [&](int i) -> std::string {
+        const int cp = has_colors() ? line_cp(g_lines[i]) : 0;
+        return (cp == CP_RESP) ? strip_md(g_lines[i]) : g_lines[i];
+    };
+    auto vrows = [&](int i) -> int {
+        const std::string s = rendered(i);
+        if (s.empty()) return 1;
+        return std::max(1, (utf8_cols(s) + cw - 1) / cw);
+    };
+
+    // Find top line: walk backward from end to fill g_out_h rows
+    int top;
+    if (g_scroll_top >= 0) {
+        top = std::min(g_scroll_top, std::max(0, total-1));
+    } else {
+        int left = g_out_h;
+        top = total;
+        while (top > 0 && left > 0) { --top; left -= vrows(top); }
+        if (left < 0) ++top; // last line pushed over — skip it
+    }
+
+    werase(g_out);
+    int row = 0;
+    for (int i = top; i < total && row < g_out_h; ++i) {
+        const auto& raw = g_lines[i];
+        const int cp = has_colors() ? line_cp(raw) : 0;
+        const std::string line = (cp == CP_RESP) ? strip_md(raw) : raw;
+        if (line.empty()) { row++; continue; }
+        int bp = 0, len = (int)line.size();
+        while (bp < len && row < g_out_h) {
+            const int chunk = bytes_for_cols(line.c_str()+bp, len-bp, cw);
+            if (chunk == 0) break;
+            if (cp) wattron(g_out, COLOR_PAIR(cp));
+            mvwaddnstr(g_out, row, OUT_PAD, line.c_str()+bp, chunk);
+            if (cp) wattroff(g_out, COLOR_PAIR(cp));
+            bp += chunk; row++;
+        }
+    }
+    g_dirty = false;
+    wrefresh(g_out);
+}
+
+// ── Scroll ────────────────────────────────────────────────────────────────────
+static void output_scroll_up(int n) {
+    std::lock_guard<std::mutex> lk(g_out_mu);
+    const int total = (int)g_lines.size();
+    const int cur   = (g_scroll_top < 0) ? std::max(0, total-g_out_h) : g_scroll_top;
+    g_scroll_top = std::max(0, cur-n);
+    g_dirty = true;
+}
+static void output_scroll_down(int n) {
+    std::lock_guard<std::mutex> lk(g_out_mu);
+    const int total = (int)g_lines.size();
+    if (g_scroll_top < 0) return;
+    g_scroll_top += n;
+    if (g_scroll_top + g_out_h >= total) g_scroll_top = -1;
+    g_dirty = true;
+}
+
+// ── Input state ───────────────────────────────────────────────────────────────
+struct InputState {
+    std::string buf;
+    int cursor=0, view_col=0;
+    std::vector<std::string> history;
+    int hist_idx=-1;
+    std::string hist_saved;
+
+    static int prev_utf8(const std::string& s, int p) {
+        if (p<=0) return 0;
+        do { --p; } while (p>0 && ((unsigned char)s[p]&0xC0)==0x80);
+        return p;
+    }
+    static int next_utf8(const std::string& s, int p) {
+        if (p>=(int)s.size()) return (int)s.size();
+        do { ++p; } while (p<(int)s.size() && ((unsigned char)s[p]&0xC0)==0x80);
+        return p;
+    }
+    static int cols_to(const std::string& s, int bp) {
+        int col=0;
+        for (int i=0; i<bp && i<(int)s.size(); ) {
+            unsigned char c=(unsigned char)s[i];
+            if      (c<0x80){col++;i++;}
+            else if (c<0xE0){col++;i+=2;}
+            else if (c<0xF0){col++;i+=3;}
+            else            {col++;i+=4;}
+        }
+        return col;
+    }
+    void insert(unsigned char c){ buf.insert(buf.begin()+cursor,(char)c); ++cursor; }
+    void backspace(){ if(cursor<=0) return; int p=prev_utf8(buf,cursor); buf.erase(p,cursor-p); cursor=p; }
+    void del_fwd(){ if(cursor>=(int)buf.size()) return; buf.erase(cursor,next_utf8(buf,cursor)-cursor); }
+    void left() { cursor=prev_utf8(buf,cursor); }
+    void right(){ cursor=next_utf8(buf,cursor); }
+    void home() { cursor=0; }
+    void end()  { cursor=(int)buf.size(); }
+    void hist_up(){
+        if(history.empty()) return;
+        if(hist_idx<0){hist_saved=buf;hist_idx=(int)history.size()-1;}
+        else if(hist_idx>0) --hist_idx;
+        buf=history[hist_idx]; cursor=(int)buf.size();
+    }
+    void hist_down(){
+        if(hist_idx<0) return;
+        if(hist_idx<(int)history.size()-1){++hist_idx;buf=history[hist_idx];}
+        else{hist_idx=-1;buf=hist_saved;}
+        cursor=(int)buf.size();
+    }
+    std::string submit(){
+        std::string r=buf;
+        if(!buf.empty()&&(history.empty()||history.back()!=buf)) history.push_back(buf);
+        buf.clear(); cursor=0; hist_idx=-1;
+        return r;
+    }
+    void clear(){ buf.clear(); cursor=0; }
 };
+
+static constexpr int PFX_COLS = 4; // "◆ > "
+
+static void draw_input(InputState& inp) {
+    if (!g_inp) return;
+    werase(g_inp);
+    const int avail = COLS - PFX_COLS;
+    if (avail <= 0) { wrefresh(g_inp); return; }
+    const int cur_col = inp.cols_to(inp.buf, inp.cursor);
+    if (cur_col < inp.view_col) inp.view_col = cur_col;
+    else if (cur_col >= inp.view_col+avail) inp.view_col = cur_col-avail+1;
+    int vbyte = 0;
+    for (int vc=0; vc<inp.view_col && vbyte<(int)inp.buf.size(); ++vc)
+        vbyte = inp.next_utf8(inp.buf, vbyte);
+    const attr_t pa = has_colors() ? (COLOR_PAIR(CP_USER)|A_BOLD) : A_BOLD;
+    wattron(g_inp, pa); mvwaddstr(g_inp, 0, 0, "◆ > "); wattroff(g_inp, pa);
+    int ebyte=vbyte, cw=0;
+    while (ebyte<(int)inp.buf.size() && cw<avail){ ebyte=inp.next_utf8(inp.buf,ebyte); ++cw; }
+    if (vbyte<ebyte) waddnstr(g_inp, inp.buf.c_str()+vbyte, ebyte-vbyte);
+    wmove(g_inp, 0, PFX_COLS+cur_col-inp.view_col);
+    wrefresh(g_inp);
+}
+
+// ── read_line_tui: blocking input inside ncurses (no endwin) ─────────────────
+static std::string read_line_tui(const std::string& prompt) {
+    std::string line;
+    g_dirty = true;
+    while (true) {
+        flush_output();
+        if (g_inp) {
+            werase(g_inp);
+            const attr_t pa = has_colors() ? (COLOR_PAIR(CP_STATUS)|A_BOLD) : A_BOLD;
+            wattron(g_inp, pa);
+            mvwaddstr(g_inp, 0, 0, prompt.c_str());
+            wattroff(g_inp, pa);
+            waddstr(g_inp, line.c_str());
+            wmove(g_inp, 0, utf8_cols(prompt)+(int)utf8_cols(line));
+            wrefresh(g_inp);
+        }
+        const int ch = wgetch(g_inp);
+        if (ch == ERR) continue;
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) return line;
+        if (ch == 27) return "";
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (!line.empty()) {
+                do { line.pop_back(); }
+                while (!line.empty() && ((unsigned char)line.back()&0xC0)==0x80);
+            }
+        } else if (ch >= 32 && ch <= 255) {
+            line += (char)(unsigned char)ch;
+        }
+    }
+}
+
+// ── Tab completion ────────────────────────────────────────────────────────────
+static const std::vector<std::string> CMDS = {
+    "/plan","/build","/model","/reset","/sessions","/delete","/verbose","/mouse","/exit"
+};
+static void tab_complete(InputState& inp) {
+    if (inp.buf.empty() || inp.buf[0]!='/') return;
+    std::vector<std::string> m;
+    for (const auto& c : CMDS)
+        if (c.size()>=inp.buf.size() && c.substr(0,inp.buf.size())==inp.buf) m.push_back(c);
+    if (m.size()==1){ inp.buf=m[0]; inp.cursor=(int)inp.buf.size(); }
+    else if (m.size()>1){ std::string s="  "; for(auto&c:m) s+=c+"  "; out_push(s+"\n"); }
+}
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 static std::string expand_home(const std::string& path) {
-    if (path.empty() || path[0] != '~') return path;
-    const char* home = getenv("HOME");
-    return home ? std::string(home) + path.substr(1) : path;
+    if (path.empty() || path[0]!='~') return path;
+    const char* h = getenv("HOME");
+    return h ? std::string(h)+path.substr(1) : path;
 }
-
 static std::string make_session_slug(const std::string& msg) {
-    std::string slug;
-    bool last_dash = false;
+    std::string slug; bool last_dash=false;
     for (unsigned char c : msg) {
-        if (c >= 0x80 || std::isalnum(c)) {
-            slug += (char)c;
-            last_dash = false;
-        } else if (std::isspace(c) || c == '-' || c == '_') {
-            if (!last_dash && !slug.empty()) {
-                slug += '-';
-                last_dash = true;
-            }
+        if (c>=0x80||std::isalnum(c)){ slug+=(char)c; last_dash=false; }
+        else if (std::isspace(c)||c=='-'||c=='_'){
+            if(!last_dash&&!slug.empty()){ slug+='-'; last_dash=true; }
         }
-        if (slug.size() >= 40) break;
+        if (slug.size()>=40) break;
     }
-    while (!slug.empty() && slug.back() == '-') slug.pop_back();
-    return slug.empty() ? "session" : slug;
+    while (!slug.empty()&&slug.back()=='-') slug.pop_back();
+    return slug.empty()?"session":slug;
 }
-
 static std::string unique_session_path(const std::string& dir, const std::string& slug) {
-    const std::string base = dir + "/" + slug;
-    std::string path = base + ".json";
-    for (int i = 2; fs::exists(path); ++i)
-        path = base + "_" + std::to_string(i) + ".json";
+    const std::string base = dir+"/"+slug;
+    std::string path = base+".json";
+    for (int i=2; fs::exists(path); ++i) path = base+"_"+std::to_string(i)+".json";
     return path;
 }
 
-// ── Session listing ───────────────────────────────────────────────────────────
-struct SessionEntry {
-    std::string        path;
-    std::string        title;
-    int                count = 0;
-    fs::file_time_type mtime;
-};
+// ── Session management ────────────────────────────────────────────────────────
+struct SessionEntry { std::string path,title; int count=0; fs::file_time_type mtime; };
 
 static std::vector<SessionEntry> scan_sessions(const std::string& dir_raw) {
     const std::string dir = expand_home(dir_raw);
     std::vector<SessionEntry> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-        if (ec) { ec.clear(); continue; }
-        if (e.path().extension() != ".json") continue;
-
+    for (const auto& e : fs::directory_iterator(dir,ec)) {
+        if (ec){ ec.clear(); continue; }
+        if (e.path().extension()!=".json") continue;
         std::ifstream f(e.path());
         if (!f.is_open()) continue;
         nlohmann::json j;
-        try { j = nlohmann::json::parse(f); } catch (...) { continue; }
-        if (!j.is_array() || j.empty()) continue;
-
-        SessionEntry se;
-        se.path  = e.path().string();
-        se.count = (int)j.size();
-        std::error_code mec;
-        se.mtime = e.last_write_time(mec);
-
-        for (const auto& msg : j) {
-            if (msg.value("role", "") == "user") {
-                std::string t = msg.value("content", "");
-                while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
-                se.title = t.size() > 55 ? t.substr(0, 52) + "\xe2\x80\xa6" : t;
-                break;
+        try { j=nlohmann::json::parse(f); } catch(...){ continue; }
+        if (!j.is_array()||j.empty()) continue;
+        SessionEntry se; se.path=e.path().string(); se.count=(int)j.size();
+        std::error_code mec; se.mtime=e.last_write_time(mec);
+        for (const auto& msg:j) {
+            if (msg.value("role","")=="user") {
+                std::string t=msg.value("content","");
+                while (!t.empty()&&(t.back()=='\n'||t.back()=='\r')) t.pop_back();
+                se.title = t.size()>55 ? t.substr(0,52)+"…" : t; break;
             }
         }
-        if (se.title.empty()) se.title = e.path().stem().string();
+        if (se.title.empty()) se.title=e.path().stem().string();
         out.push_back(std::move(se));
     }
-    std::sort(out.begin(), out.end(), [](const SessionEntry& a, const SessionEntry& b) {
-        return a.mtime > b.mtime;
-    });
+    std::sort(out.begin(),out.end(),[](const SessionEntry&a,const SessionEntry&b){ return a.mtime>b.mtime; });
     return out;
 }
 
-static int prompt_session(const std::vector<SessionEntry>& sessions) {
-    std::cout << "\n  \033[1mСессии:\033[0m\n";
-    std::cout << "    \033[2m[0]  новая сессия\033[0m\n";
-    for (int i = 0; i < (int)sessions.size(); ++i)
-        printf("    \033[36m[%d]\033[0m  %-56s \033[2m(%d сообщ.)\033[0m\n",
-               i + 1, sessions[i].title.c_str(), sessions[i].count);
-    printf("\n  Выбери [0-%d] или Enter для новой: ", (int)sessions.size());
-    fflush(stdout);
-
-    std::string line;
-    if (!std::getline(std::cin, line)) return -1;
-    if (line.empty()) return 0;
+// ── Session selection (runs inside TUI) ───────────────────────────────────────
+static int tui_pick_session(const std::vector<SessionEntry>& sessions) {
+    std::string s = "\n  Sessions — choose to load, or Enter for new:\n";
+    s += "  [0]  new session\n";
+    for (int i=0; i<(int)sessions.size(); ++i) {
+        char buf[300];
+        snprintf(buf,sizeof(buf),"  [%d]  %-50s  (%d msg)",
+                 i+1, sessions[i].title.c_str(), sessions[i].count);
+        s += std::string(buf)+"\n";
+    }
+    out_push(s);
+    const std::string ans = read_line_tui("  > ");
+    out_push("\n");
+    if (ans.empty()) return 0;
     try {
-        const int n = std::stoi(line);
-        if (n >= 0 && n <= (int)sessions.size()) return n;
+        const int n = std::stoi(ans);
+        if (n>=0 && n<=(int)sessions.size()) return n;
     } catch (...) {}
     return 0;
 }
 
-// ── Session delete ────────────────────────────────────────────────────────────
-// Shows numbered list, lets user pick one or more (comma-separated) to delete.
-// Returns true if the current session was among deleted files.
-static bool cmd_delete(const std::string& sessions_dir,
-                       const std::string& current_path) {
-    if (sessions_dir.empty()) {
-        std::cout << "[sessions_dir не задан в config.json]\n";
-        return false;
-    }
+// ── /sessions command ─────────────────────────────────────────────────────────
+static void cmd_sessions(const std::string& sessions_dir, const std::string& cur_path) {
+    if (sessions_dir.empty()) { out_push("[sessions_dir not set]\n"); return; }
     const auto list = scan_sessions(sessions_dir);
-    if (list.empty()) {
-        std::cout << "[нет сохранённых сессий]\n";
-        return false;
+    if (list.empty()) { out_push("[no saved sessions]\n"); return; }
+    std::string s = "\n  Sessions:\n";
+    for (int i=0; i<(int)list.size(); ++i) {
+        char buf[300];
+        snprintf(buf,sizeof(buf),"  [%d]  %-50s  (%d msg)%s",
+                 i+1, list[i].title.c_str(), list[i].count,
+                 list[i].path==cur_path?"  ← current":"");
+        s += std::string(buf)+"\n";
     }
+    out_push(s+"\n");
+}
 
-    std::cout << "\n  \033[1mУдалить сессию:\033[0m\n";
-    for (int i = 0; i < (int)list.size(); ++i) {
-        const bool cur = (list[i].path == current_path);
-        printf("    \033[36m[%d]\033[0m  %-54s \033[2m(%d сообщ.)%s\033[0m\n",
-               i + 1, list[i].title.c_str(), list[i].count,
-               cur ? "  ← текущая" : "");
+// ── /delete command ───────────────────────────────────────────────────────────
+static bool cmd_delete(const std::string& sessions_dir, const std::string& cur_path) {
+    if (sessions_dir.empty()) { out_push("[sessions_dir not set]\n"); return false; }
+    const auto list = scan_sessions(sessions_dir);
+    if (list.empty()) { out_push("[no saved sessions]\n"); return false; }
+    std::string menu = "\n  Delete session:\n";
+    for (int i=0; i<(int)list.size(); ++i) {
+        char buf[300];
+        snprintf(buf,sizeof(buf),"  [%d]  %-50s  (%d msg)%s",
+                 i+1, list[i].title.c_str(), list[i].count,
+                 list[i].path==cur_path?"  ← current":"");
+        menu += std::string(buf)+"\n";
     }
-    std::cout << "\n  Введи номера через запятую (или Enter для отмены): " << std::flush;
-
-    std::string line;
-    if (!std::getline(std::cin, line) || line.empty()) {
-        std::cout << "[отмена]\n";
-        return false;
-    }
-
-    bool deleted_current = false;
-    std::istringstream ss(line);
-    std::string tok;
-    while (std::getline(ss, tok, ',')) {
-        // trim whitespace
-        const size_t s = tok.find_first_not_of(" \t");
-        const size_t e = tok.find_last_not_of(" \t");
-        if (s == std::string::npos) continue;
-        tok = tok.substr(s, e - s + 1);
+    out_push(menu);
+    const std::string line = read_line_tui("  numbers (comma-sep) or Enter to cancel: ");
+    if (line.empty()) { out_push("[cancelled]\n"); return false; }
+    bool deleted_cur = false;
+    std::istringstream ss(line); std::string tok;
+    while (std::getline(ss,tok,',')) {
+        const size_t a=tok.find_first_not_of(" \t"), b=tok.find_last_not_of(" \t");
+        if (a==std::string::npos) continue;
+        tok=tok.substr(a,b-a+1);
         try {
-            const int n = std::stoi(tok);
-            if (n < 1 || n > (int)list.size()) {
-                std::cout << "  [пропущен неверный номер " << n << "]\n";
-                continue;
-            }
-            const auto& se = list[n - 1];
-            std::error_code ec;
-            fs::remove(se.path, ec);
-            if (ec)
-                printf("  \033[31m✗\033[0m %s: %s\n", se.title.c_str(), ec.message().c_str());
-            else {
-                printf("  \033[32m✓\033[0m удалена «%s»\n", se.title.c_str());
-                if (se.path == current_path) deleted_current = true;
-            }
-        } catch (...) {
-            std::cout << "  [пропущен: «" << tok << "» не число]\n";
-        }
+            const int n=std::stoi(tok);
+            if (n<1||n>(int)list.size()){ out_push("  [invalid: "+tok+"]\n"); continue; }
+            std::error_code ec; fs::remove(list[n-1].path,ec);
+            out_push(ec?"  ✗ "+list[n-1].title+"\n":"  ✓ deleted: "+list[n-1].title+"\n");
+            if (!ec && list[n-1].path==cur_path) deleted_cur=true;
+        } catch(...){ out_push("  [not a number: "+tok+"]\n"); }
     }
-    return deleted_current;
+    return deleted_cur;
 }
 
-// ── Banners ───────────────────────────────────────────────────────────────────
-static void print_usage(const char* prog) {
-    std::cerr
-        << "Использование: " << prog
-        << " [--config <путь>] [--mode plan|build] [--verbose] [--no-stream]\n"
-        << "Команды: /plan  /build  /reset  /sessions  /delete  /verbose  /exit\n";
+// ── /model command ────────────────────────────────────────────────────────────
+static std::string model_short(const std::string& path) {
+    std::string s = fs::path(path).stem().string();
+    if (s.size()>20) s=s.substr(0,17)+"...";
+    return s;
+}
+static std::vector<std::string> scan_models(const std::string& dir="./models") {
+    std::vector<std::string> out; std::error_code ec;
+    for (const auto& e:fs::directory_iterator(dir,ec)) {
+        if (ec){ ec.clear(); continue; }
+        if (e.path().extension()==".gguf") out.push_back(e.path().string());
+    }
+    std::sort(out.begin(),out.end()); return out;
+}
+static std::string cmd_model(const std::string& current_model) {
+    const auto models = scan_models();
+    if (models.empty()) { out_push("[no .gguf files in ./models/]\n"); return ""; }
+    std::string menu = "\n  Models:\n  [0]  keep current ("+model_short(current_model)+")\n";
+    for (int i=0; i<(int)models.size(); ++i)
+        menu += "  ["+std::to_string(i+1)+"]  "+model_short(models[i])
+                +(models[i]==current_model?"  ← current":"")+"\n";
+    out_push(menu);
+    const std::string line = read_line_tui("  choose [0-"+std::to_string(models.size())+"]: ");
+    if (line.empty()) return "";
+    try {
+        const int n=std::stoi(line);
+        if (n==0) return "";
+        if (n>=1&&n<=(int)models.size()) return models[n-1];
+    } catch(...) {}
+    out_push("[invalid choice]\n");
+    return "";
 }
 
-static std::string prompt_working_dir(const std::string& current) {
-    const std::string def = (current.empty() || current == ".")
-        ? (std::string(getenv("HOME") ? getenv("HOME") : "/home") + "/Projects")
-        : current;
-    std::cout << "Рабочая папка [" << def << "]: " << std::flush;
-    std::string input;
-    std::getline(std::cin, input);
-    return input.empty() ? def : input;
-}
-
-static void print_mode_banner(AgentMode m) {
-    if (m == AgentMode::Plan)
-        std::cout << "  \033[33m◆ план\033[0m  \033[2mтолько чтение · без изменений\033[0m\n";
-    else
-        std::cout << "  \033[32m◆ build\033[0m \033[2mполный доступ к инструментам\033[0m\n";
+// ── Mouse toggle ──────────────────────────────────────────────────────────────
+static bool g_mouse_on = true;
+static void toggle_mouse() {
+    g_mouse_on = !g_mouse_on;
+    if (g_mouse_on) {
+        mousemask(ALL_MOUSE_EVENTS|REPORT_MOUSE_POSITION, nullptr);
+        out_push("[mouse: on — Shift+drag to copy]\n");
+    } else {
+        mousemask(0, nullptr);
+        out_push("[mouse: off — drag normally to copy]\n");
+    }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
-    std::signal(SIGINT, handle_signal);
+    std::string config_path = "./config.json";
+    bool override_verbose=false, mode_override=false;
+    AgentMode override_mode = AgentMode::Build;
 
-    std::string config_path        = "./config.json";
-    bool        override_verbose   = false;
-    bool        override_no_stream = false;
-    bool        mode_override      = false;
-    AgentMode   override_mode      = AgentMode::Build;
-
-    for (int i = 1; i < argc; ++i) {
+    for (int i=1; i<argc; ++i) {
         const std::string arg(argv[i]);
-        if (arg == "--config" && i + 1 < argc) {
-            config_path = argv[++i];
-        } else if (arg == "--mode" && i + 1 < argc) {
-            override_mode = mode_from_string(argv[++i]);
-            mode_override = true;
-        } else if (arg == "--verbose") {
-            override_verbose = true;
-        } else if (arg == "--no-stream") {
-            override_no_stream = true;
-        } else if (arg == "--help" || arg == "-h") {
-            print_usage(argv[0]);
-            return 0;
-        } else {
-            std::cerr << "Неизвестный аргумент: " << arg << "\n";
-            print_usage(argv[0]);
-            return 1;
+        if      (arg=="--config" && i+1<argc) config_path=argv[++i];
+        else if (arg=="--mode"   && i+1<argc){ override_mode=mode_from_string(argv[++i]); mode_override=true; }
+        else if (arg=="--verbose") override_verbose=true;
+        else if (arg=="--help"||arg=="-h"){
+            std::cout<<"Usage: ai-agent [--config PATH] [--mode plan|build] [--verbose]\n"; return 0;
         }
     }
 
     AppConfig cfg;
-    try {
-        cfg = load_config(config_path);
-    } catch (const std::exception& e) {
-        std::cerr << "[ошибка] " << e.what() << "\n";
-        return 1;
-    }
+    try { cfg=load_config(config_path); }
+    catch(const std::exception& e){ std::cerr<<"[error] "<<e.what()<<"\n"; return 1; }
+    if (override_verbose) cfg.agent.verbose=true;
+    if (mode_override)    cfg.agent.mode=override_mode;
 
-    if (override_verbose)    cfg.agent.verbose = true;
-    if (override_no_stream)  cfg.agent.stream  = false;
-    if (mode_override)       cfg.agent.mode    = override_mode;
-
-    if (cfg.tools.enabled) {
-        cfg.tools.working_dir = prompt_working_dir(cfg.tools.working_dir);
-        std::error_code ec;
-        fs::create_directories(cfg.tools.working_dir, ec);
-        if (ec) {
-            std::cerr << "[ошибка] Не удалось создать папку '"
-                      << cfg.tools.working_dir << "': " << ec.message() << "\n";
-            return 1;
-        }
-        std::cout << "Папка готова: " << fs::absolute(cfg.tools.working_dir) << "\n\n";
-    }
-
-    std::unique_ptr<Agent> agent;
-    try {
-        std::cerr << "[инфо] Загрузка модели: " << cfg.model.path << " ...\n";
-        agent = std::make_unique<Agent>(cfg);
-        std::cerr << "[инфо] Модель загружена.\n";
-    } catch (const std::exception& e) {
-        std::cerr << "[ошибка] " << e.what() << "\n";
-        return 1;
-    }
-
-    // ── Session selection ─────────────────────────────────────────────────────
+    // Create sessions dir early (silent)
     const std::string sessions_dir_exp = expand_home(cfg.agent.sessions_dir);
-    bool session_named = false;
-
     if (!cfg.agent.sessions_dir.empty()) {
-        std::error_code ec;
-        fs::create_directories(sessions_dir_exp, ec);
+        std::error_code ec; fs::create_directories(sessions_dir_exp,ec);
+    }
+    if (cfg.tools.enabled) {
+        std::error_code ec; fs::create_directories(cfg.tools.working_dir,ec);
+    }
 
+    // Load model before ncurses (llama.cpp prints to stderr, let it show)
+    std::cerr<<"[info] Loading model: "<<cfg.model.path<<" ...\n";
+    std::unique_ptr<Agent> agent;
+    try { agent = std::make_unique<Agent>(cfg); }
+    catch(const std::exception& e){ std::cerr<<"[error] "<<e.what()<<"\n"; return 1; }
+    std::cerr<<"[info] Ready.\n";
+
+    // ── ncurses ───────────────────────────────────────────────────────────────
+    setlocale(LC_ALL,"");
+    setenv("ESCDELAY","25",1);
+    initscr(); cbreak(); noecho(); curs_set(1);
+    if (has_colors()){ start_color(); use_default_colors(); init_colors(); }
+    mousemask(ALL_MOUSE_EVENTS|REPORT_MOUSE_POSITION, nullptr);
+    mouseinterval(0);
+    std::signal(SIGWINCH, handle_sigwinch);
+    create_windows();
+
+    std::string model_name = model_short(cfg.model.path);
+    InputState  inp;
+    std::thread gen_thread;
+    bool        session_named = false;
+
+    draw_header(agent->mode(), model_name);
+    flush_output();
+    draw_input(inp);
+
+    // ── TUI: session selection ────────────────────────────────────────────────
+    if (!cfg.agent.sessions_dir.empty()) {
         const auto sessions = scan_sessions(cfg.agent.sessions_dir);
         if (!sessions.empty()) {
-            const int choice = prompt_session(sessions);
-            if (choice > 0 && choice <= (int)sessions.size()) {
-                const auto& se = sessions[choice - 1];
-                agent->set_session_path(se.path);
-                const int loaded = agent->load_session(se.path);
+            draw_header(agent->mode(), model_name);
+            const int choice = tui_pick_session(sessions);
+            if (choice>0 && choice<=(int)sessions.size()) {
+                agent->set_session_path(sessions[choice-1].path);
+                agent->load_session(sessions[choice-1].path);
                 session_named = true;
-                std::cout << "\n  \033[2m\xe2\x86\x91 загружена «" << se.title
-                          << "» (" << loaded << " сообщ.)\033[0m\n";
+                out_push("  ↑ session loaded ("+std::to_string(sessions[choice-1].count)+" messages)\n");
             }
         }
     }
 
-    std::cout << "\n";
-    print_mode_banner(agent->mode());
-    std::cout << "  \033[2m/plan  /build  /reset  /sessions  /delete  /verbose  /exit"
-                 "  \xe2\x94\x82  Ctrl+C \xe2\x80\x94 прервать генерацию\033[0m\n\n";
+    // ── Main event loop ───────────────────────────────────────────────────────
+    while (true) {
+        if (g_resize_pending.exchange(false)) resize_windows();
 
-    bool verbose_tools = false;
+        flush_output();
+        draw_header(agent->mode(), model_name);
+        draw_input(inp);
 
-    while (!g_interrupted) {
-        const bool is_plan = agent->mode() == AgentMode::Plan;
-        std::string prompt_str = std::string(is_plan ? "\033[33m" : "\033[32m")
-                                 + "\xe2\x97\x86\033[0m \033[1m>\033[0m ";
+        const int ch = wgetch(g_inp);
 
-        char* raw = readline(prompt_str.c_str());
-        if (!raw) break;   // Ctrl+D
-        std::string line(raw);
-        if (!line.empty()) add_history(raw);
-        free(raw);
-
-        if (line.empty()) continue;
-        if (line == "/exit" || line == "/quit") break;
-
-        if (line == "/plan") {
-            agent->set_mode(AgentMode::Plan);
-            print_mode_banner(AgentMode::Plan);
+        if (ch == ERR) {
+            if (g_generating) ++g_spinner_frame;
             continue;
         }
-        if (line == "/build") {
-            agent->set_mode(AgentMode::Build);
-            print_mode_banner(AgentMode::Build);
-            continue;
-        }
-        if (line == "/reset") {
-            agent->reset_history();
-            agent->set_session_path("");
-            session_named = false;
-            std::cout << "[история очищена \xe2\x80\x94 следующий запрос начнёт новую сессию]\n";
-            continue;
-        }
-        if (line == "/sessions") {
-            const std::string cur = agent->current_session_path();
-            if (cur.empty())
-                std::cout << "[сессия не сохранена \xe2\x80\x94 введите первый запрос]\n";
-            else
-                std::cout << "[текущая сессия: " << cur << "]\n";
-            if (!cfg.agent.sessions_dir.empty()) {
-                const auto list = scan_sessions(cfg.agent.sessions_dir);
-                if (list.empty())
-                    std::cout << "[нет сохранённых сессий]\n";
-                for (int i = 0; i < (int)list.size(); ++i)
-                    printf("  [%d]  %s  (%d сообщ.)%s\n",
-                           i + 1, list[i].title.c_str(), list[i].count,
-                           list[i].path == cur ? "  \xe2\x86\x90 текущая" : "");
+
+        // ESC
+        if (ch == 27) { if(g_generating) g_interrupted=true; inp.clear(); continue; }
+        // Ctrl+D
+        if (ch == 4) break;
+
+        // Mouse scroll
+        if (ch == KEY_MOUSE) {
+            MEVENT ev;
+            if (getmouse(&ev)==OK) {
+                if      (ev.bstate & BUTTON4_PRESSED)  output_scroll_up(3);
+#ifdef BUTTON5_PRESSED
+                else if (ev.bstate & BUTTON5_PRESSED)  output_scroll_down(3);
+#endif
             }
             continue;
         }
-        if (line == "/delete") {
-            const bool deleted_cur = cmd_delete(
-                cfg.agent.sessions_dir, agent->current_session_path());
-            if (deleted_cur) {
-                agent->reset_history();
-                agent->set_session_path("");
-                session_named = false;
-                std::cout << "[текущая сессия удалена \xe2\x80\x94 история очищена]\n";
+
+        // Input navigation
+        if (ch==KEY_LEFT)  { inp.left();      continue; }
+        if (ch==KEY_RIGHT) { inp.right();     continue; }
+        if (ch==KEY_UP)    { inp.hist_up();   continue; }
+        if (ch==KEY_DOWN)  { inp.hist_down(); continue; }
+        if (ch==KEY_HOME||ch==1) { inp.home(); continue; }
+        if (ch==KEY_END ||ch==5) { inp.end();  continue; }
+
+        // Output scroll
+        if (ch==KEY_PPAGE) { output_scroll_up(g_out_h/2);   continue; }
+        if (ch==KEY_NPAGE) { output_scroll_down(g_out_h/2); continue; }
+
+        // Backspace / Delete
+        if (ch==KEY_BACKSPACE||ch==127||ch==8) { inp.backspace(); continue; }
+        if (ch==KEY_DC) { inp.del_fwd(); continue; }
+
+        // Tab
+        if (ch=='\t') { tab_complete(inp); continue; }
+
+        // Ctrl+K / Ctrl+U
+        if (ch==11){ inp.buf.erase(inp.cursor); continue; }
+        if (ch==21){ inp.buf.erase(0,inp.cursor); inp.cursor=0; continue; }
+
+        // Enter
+        if (ch=='\n'||ch=='\r'||ch==KEY_ENTER) {
+            std::string line = inp.submit();
+            if (line.empty()) continue;
+            if (g_generating) { out_push("[busy — ESC to interrupt]\n"); continue; }
+
+            // Scroll back to bottom on any input
+            { std::lock_guard<std::mutex> lk(g_out_mu); g_scroll_top=-1; g_dirty=true; }
+
+            if (line=="/exit"||line=="/quit") break;
+            if (line=="/plan"){  agent->set_mode(AgentMode::Plan);  out_push("[mode: PLAN]\n");  continue; }
+            if (line=="/build"){ agent->set_mode(AgentMode::Build); out_push("[mode: BUILD]\n"); continue; }
+            if (line=="/reset"){
+                agent->reset_history(); agent->set_session_path(""); session_named=false;
+                out_push("[history cleared]\n"); continue;
             }
-            continue;
-        }
-        if (line == "/info") { agent->print_info(); continue; }
-        if (line == "/verbose") {
-            verbose_tools = !verbose_tools;
-            std::cout << (verbose_tools ? "[verbose: ON]\n" : "[verbose: OFF]\n");
-            continue;
-        }
-
-        // ── Assign session path on first real message of a new session ────
-        if (!session_named && !cfg.agent.sessions_dir.empty()) {
-            const std::string slug = make_session_slug(line);
-            const std::string path = unique_session_path(sessions_dir_exp, slug);
-            agent->set_session_path(path);
-            session_named = true;
-        }
-
-        try {
-            if (cfg.agent.stream) {
-                Spinner spinner;
-                bool header_shown = false;
-
-                auto stream_cb = [&](const std::string& piece) -> bool {
-                    spinner.stop();
-                    if (!header_shown) {
-                        std::cout << "\033[2m  \xe2\x95\xb0\xe2\x94\x80\033[0m " << std::flush;
-                        header_shown = true;
+            if (line=="/sessions"){ cmd_sessions(cfg.agent.sessions_dir, agent->current_session_path()); continue; }
+            if (line=="/delete"){
+                if (cmd_delete(cfg.agent.sessions_dir, agent->current_session_path())) {
+                    agent->reset_history(); agent->set_session_path(""); session_named=false;
+                    out_push("[current session deleted — history cleared]\n");
+                }
+                continue;
+            }
+            if (line=="/model"){
+                const std::string nm = cmd_model(cfg.model.path);
+                if (!nm.empty()&&nm!=cfg.model.path) {
+                    out_push("[loading "+model_short(nm)+" ...]\n"); flush_output();
+                    try {
+                        cfg.model.path=nm;
+                        agent=std::make_unique<Agent>(cfg);
+                        model_name=model_short(nm);
+                        agent->reset_history(); session_named=false;
+                        out_push("[model: "+model_name+"]\n");
+                    } catch(const std::exception& e){
+                        out_push("[error loading model: "+std::string(e.what())+"]\n");
                     }
-                    (void)verbose_tools;
-                    std::cout << piece << std::flush;
-                    return !g_interrupted;
-                };
-
-                auto think_cb = [&]() { spinner.start(); };
-
-                agent->chat(line, stream_cb, think_cb);
-                spinner.stop();
-                std::cout << "\n\n";
-            } else {
-                std::cout << agent->chat(line) << "\n\n";
+                }
+                continue;
             }
-            agent->save_history();
-        } catch (const std::exception& e) {
-            std::cerr << "\n\033[31m  \xe2\x9c\x97 " << e.what() << "\033[0m\n";
+            if (line=="/mouse"){ toggle_mouse(); continue; }
+            if (line=="/verbose"){ cfg.agent.verbose=!cfg.agent.verbose;
+                out_push(cfg.agent.verbose?"[verbose: on]\n":"[verbose: off]\n"); continue; }
+
+            // Assign session path on first real message
+            if (!session_named && !cfg.agent.sessions_dir.empty()) {
+                agent->set_session_path(unique_session_path(sessions_dir_exp, make_session_slug(line)));
+                session_named=true;
+            }
+
+            out_push("\n◆ > "+line+"\n  ╰─ \n");
+
+            g_generating=true; g_interrupted=false;
+            if (gen_thread.joinable()) gen_thread.join();
+
+            gen_thread = std::thread([&, line]() {
+                try {
+                    auto stream_cb = [&](const std::string& piece) -> bool {
+                        out_push(strip_ansi(piece));
+                        return !g_interrupted;
+                    };
+                    auto think_cb = [&]() { out_push("[thinking...]\n"); };
+                    agent->chat(line, stream_cb, think_cb);
+                    out_push("\n");
+                    agent->save_history();
+                } catch(const std::exception& e) {
+                    out_push("\n[error: "+std::string(e.what())+"]\n");
+                }
+                if (g_interrupted) out_push("[interrupted]\n");
+                g_generating=false; g_interrupted=false;
+            });
+            continue;
         }
 
-        if (g_interrupted) {
-            std::cout << "\n\033[2m[прервано]\033[0m\n\n";
-            g_interrupted = 0;
-        }
+        // Regular UTF-8 char
+        if (ch>=32 && ch<=255) inp.insert((unsigned char)ch);
     }
 
-    std::cout << "\n\xd0\x9f\xd0\xbe\xd0\xba\xd0\xb0.\n";
+    g_interrupted=true;
+    if (gen_thread.joinable()) gen_thread.join();
+    destroy_windows(); endwin();
     return 0;
 }

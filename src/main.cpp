@@ -199,7 +199,7 @@ static void draw_header(AgentMode mode, const std::string& model_name) {
     std::string spin = g_generating ? std::string(" ")+SPINNER[g_spinner_frame%SPINNER_N] : "";
     std::string stag = (g_scroll_top >= 0) ? " [↑]" : "";
     std::string left = " ◆ ai-agent  |  " + std::string(ms) + spin + stag + "  |  " + model_name;
-    const std::string right = " Shift+drag: copy  PgUp/Dn: scroll  ESC: stop ";
+    const std::string right = " PgUp/Dn: scroll  /mouse: колесо  ESC: стоп ";
     const int pad = COLS - utf8_cols(left) - utf8_cols(right);
     for (int i=0; i<pad; ++i) left += ' ';
     left += right;
@@ -207,53 +207,53 @@ static void draw_header(AgentMode mode, const std::string& model_name) {
     wattroff(g_hdr, ha); wrefresh(g_hdr);
 }
 
-// ── flush_output with word-wrap ───────────────────────────────────────────────
+// ── flush_output: pre-expand to visual rows, slice last g_out_h ──────────────
 static void flush_output() {
     if (!g_out) return;
     std::lock_guard<std::mutex> lk(g_out_mu);
     if (!g_dirty) return;
 
     const int total = (int)g_lines.size();
-    const int cw    = std::max(1, COLS - 2*OUT_PAD);
+    const int cw = std::max(1, COLS - 2*OUT_PAD);
 
-    // Pre-render lines and compute visual row count
-    auto rendered = [&](int i) -> std::string {
-        const int cp = has_colors() ? line_cp(g_lines[i]) : 0;
-        return (cp == CP_RESP) ? strip_md(g_lines[i]) : g_lines[i];
-    };
-    auto vrows = [&](int i) -> int {
-        const std::string s = rendered(i);
-        if (s.empty()) return 1;
-        return std::max(1, (utf8_cols(s) + cw - 1) / cw);
-    };
+    struct VRow { std::string text; int cp; };
+    std::vector<VRow> vrows;
+    vrows.reserve(std::max(total, 1) * 2);
+    std::vector<int> lstart; // logical line i → first VRow index
+    lstart.reserve(total);
 
-    // Find top line: walk backward from end to fill g_out_h rows
-    int top;
-    if (g_scroll_top >= 0) {
-        top = std::min(g_scroll_top, std::max(0, total-1));
-    } else {
-        int left = g_out_h;
-        top = total;
-        while (top > 0 && left > 0) { --top; left -= vrows(top); }
-        if (left < 0) ++top; // last line pushed over — skip it
-    }
-
-    werase(g_out);
-    int row = 0;
-    for (int i = top; i < total && row < g_out_h; ++i) {
+    for (int i = 0; i < total; ++i) {
+        lstart.push_back((int)vrows.size());
         const auto& raw = g_lines[i];
         const int cp = has_colors() ? line_cp(raw) : 0;
         const std::string line = (cp == CP_RESP) ? strip_md(raw) : raw;
-        if (line.empty()) { row++; continue; }
+        if (line.empty()) { vrows.push_back({"", cp}); continue; }
         int bp = 0, len = (int)line.size();
-        while (bp < len && row < g_out_h) {
+        while (bp < len) {
             const int chunk = bytes_for_cols(line.c_str()+bp, len-bp, cw);
             if (chunk == 0) break;
-            if (cp) wattron(g_out, COLOR_PAIR(cp));
-            mvwaddnstr(g_out, row, OUT_PAD, line.c_str()+bp, chunk);
-            if (cp) wattroff(g_out, COLOR_PAIR(cp));
-            bp += chunk; row++;
+            vrows.push_back({line.substr(bp, chunk), cp});
+            bp += chunk;
         }
+    }
+
+    const int vtotal = (int)vrows.size();
+    int vstart;
+    if (g_scroll_top >= 0 && total > 0) {
+        vstart = lstart[std::min(g_scroll_top, total-1)];
+    } else {
+        vstart = std::max(0, vtotal - g_out_h);
+    }
+
+    werase(g_out);
+    for (int row = 0; row < g_out_h; ++row) {
+        const int vi = vstart + row;
+        if (vi >= vtotal) break;
+        const auto& vr = vrows[vi];
+        if (vr.text.empty()) continue;
+        if (vr.cp) wattron(g_out, COLOR_PAIR(vr.cp));
+        mvwaddstr(g_out, row, OUT_PAD, vr.text.c_str());
+        if (vr.cp) wattroff(g_out, COLOR_PAIR(vr.cp));
     }
     g_dirty = false;
     wrefresh(g_out);
@@ -559,15 +559,15 @@ static std::string cmd_model(const std::string& current_model) {
 }
 
 // ── Mouse toggle ──────────────────────────────────────────────────────────────
-static bool g_mouse_on = true;
+static bool g_mouse_on = false;
 static void toggle_mouse() {
     g_mouse_on = !g_mouse_on;
     if (g_mouse_on) {
         mousemask(ALL_MOUSE_EVENTS|REPORT_MOUSE_POSITION, nullptr);
-        out_push("[mouse: on — Shift+drag to copy]\n");
+        out_push("[mouse: on — колёсо работает, для копирования /mouse]\n");
     } else {
         mousemask(0, nullptr);
-        out_push("[mouse: off — drag normally to copy]\n");
+        out_push("[mouse: off — выделение и копирование работает, /mouse для колеса]\n");
     }
 }
 
@@ -614,7 +614,7 @@ int main(int argc, char** argv) {
     setenv("ESCDELAY","25",1);
     initscr(); cbreak(); noecho(); curs_set(1);
     if (has_colors()){ start_color(); use_default_colors(); init_colors(); }
-    mousemask(ALL_MOUSE_EVENTS|REPORT_MOUSE_POSITION, nullptr);
+    mousemask(0, nullptr);   // off by default — text selection works; /mouse toggles scroll
     mouseinterval(0);
     std::signal(SIGWINCH, handle_sigwinch);
     create_windows();

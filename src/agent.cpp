@@ -84,6 +84,12 @@ static std::string format_tool_line(const std::string& name,
         if (arg.size() > 45) arg = arg.substr(0, 42) + "…";
     } else if (name == "search_files")
         arg = "\"" + args.value("pattern", "?") + "\" in " + args.value("directory", ".");
+    else if (name == "web_search")
+        arg = "\"" + args.value("query", "?") + "\"";
+    else if (name == "fetch_url") {
+        arg = args.value("url", "?");
+        if (arg.size() > 50) arg = arg.substr(0, 47) + "…";
+    }
 
     return "\n  \033[34m⦿\033[0m \033[1m" + name + "\033[0m"
            "(\033[33m" + arg + "\033[0m)  "
@@ -340,47 +346,67 @@ Agent::generate_next(StreamCallback cb, bool has_tool_turns) {
         pending += std::string(buf, n);
 
         // ── echo-hold: detect and discard JSON echo of tool responses ─────
-        // Runs only while in_echo_hold=true (requires has_tool_turns=true).
-        // Uses a label so we can re-check after suppressing one echo block.
+        // After tool turns, the model sometimes re-emits the injected tool response
+        // JSON verbatim before saying anything useful. We hold all tokens silently
+        // until we can determine: is the content an echo (suppress) or real output?
+        //
+        // Control sequences that terminate the echo JSON in the model's output:
+        // • </tool_response>  – definitive echo marker
+        // • <|channel>        – model switches channel (thinking/response)
+        // • <|turn>           – turn boundary
+        // • <tool_call>       – model made a real tool call after echoing
+        //
+        // When found: suppress everything up to the marker, leave marker in pending.
+        static const char* ECHO_CTRL[] = {
+            RESP_CLOSE, "<|channel>", "<|turn>", "<tool_call>", "<|tool_call>", nullptr
+        };
         echo_hold_check:
         if (in_echo_hold) {
             const size_t fnws = pending.find_first_not_of(" \t\n\r");
             bool still_holding = true;
 
-            if (fnws == std::string::npos) {
-                // Only whitespace accumulated — keep holding
-            } else if (pending[fnws] == '{') {
-                // Starts with '{': potential echo of injected tool response JSON
-                const size_t rc = pending.find(RESP_CLOSE);
-                if (rc != std::string::npos) {
-                    // Found </tool_response> — confirmed echo, suppress
-                    total += pending.substr(0, rc + strlen(RESP_CLOSE));
-                    pending = pending.substr(rc + strlen(RESP_CLOSE));
-                    // Stay in echo_hold: model may emit consecutive echoes
-                    goto echo_hold_check;
-                } else if ((int)pending.size() > ECHO_HOLD_LIMIT) {
-                    // Too long for an echo — treat as legitimate content
+            if (fnws != std::string::npos) {
+                if (pending[fnws] == '{') {
+                    // Potential JSON echo — scan for a terminator
+                    size_t earliest_ctrl = std::string::npos;
+                    const char* earliest_tag = nullptr;
+                    for (int ci = 0; ECHO_CTRL[ci]; ++ci) {
+                        const size_t cp = pending.find(ECHO_CTRL[ci]);
+                        if (cp < earliest_ctrl) { earliest_ctrl = cp; earliest_tag = ECHO_CTRL[ci]; }
+                    }
+                    if (earliest_ctrl != std::string::npos) {
+                        if (earliest_tag == RESP_CLOSE) {
+                            // Include the close tag in suppressed section; re-check remainder
+                            total += pending.substr(0, earliest_ctrl + strlen(RESP_CLOSE));
+                            pending = pending.substr(earliest_ctrl + strlen(RESP_CLOSE));
+                        } else {
+                            // Suppress echo JSON up to the control sequence
+                            total += pending.substr(0, earliest_ctrl);
+                            pending = pending.substr(earliest_ctrl);
+                        }
+                        in_echo_hold = false;
+                        still_holding = false;
+                        if (in_echo_hold) goto echo_hold_check; // re-check if still in hold
+                    } else if ((int)pending.size() > ECHO_HOLD_LIMIT) {
+                        // No control sequence in 4KB — not really an echo; release as-is
+                        in_echo_hold = false;
+                        still_holding = false;
+                    }
+                    // else: keep accumulating
+                } else {
+                    // Doesn't start with '{' — not a JSON echo; release immediately
                     in_echo_hold = false;
                     still_holding = false;
                 }
-                // else: keep accumulating
-            } else {
-                // First non-space char is not '{' — not a JSON echo
-                in_echo_hold = false;
-                still_holding = false;
             }
 
             if (still_holding) {
-                // Defer all detection; only decode token and iterate
                 llama_batch decode_batch = llama_batch_get_one(&tok, 1);
-                if (llama_decode(impl_->ctx, decode_batch) != 0) {
-                    total += pending;
-                    break;
-                }
+                if (llama_decode(impl_->ctx, decode_batch) != 0) { total += pending; break; }
                 impl_->n_past++;
                 continue;
             }
-            // in_echo_hold was cleared — fall through to normal processing
+            // in_echo_hold cleared — fall through to normal detection
         }
 
         // ── end-of-turn ───────────────────────────────────────────────────
@@ -886,5 +912,6 @@ void Agent::save_history() const {
     }
 
     std::ofstream f(session_path_);
-    if (f.is_open()) f << arr.dump(2);
+    if (f.is_open())
+        f << arr.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 }

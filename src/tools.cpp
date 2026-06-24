@@ -9,6 +9,17 @@
 
 namespace fs = std::filesystem;
 
+// Percent-encode a string for use in URLs.
+static std::string url_encode(const std::string& s) {
+    std::string r;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+            r += c;
+        else { char b[4]; std::snprintf(b, sizeof(b), "%%%02X", c); r += b; }
+    }
+    return r;
+}
+
 // Resolve a path: if relative, anchor it to base_dir.
 static std::string resolve_path(const std::string& path, const std::string& base_dir) {
     if (path.empty()) return base_dir;
@@ -118,6 +129,51 @@ static ToolResult impl_search_files(const std::string& pattern,
     return impl_run_command(cmd, working_dir);
 }
 
+static ToolResult impl_web_search(const std::string& query) {
+    if (query.empty()) return {false, "missing: query"};
+
+    static const std::string VENV_PY  = std::string(getenv("HOME") ? getenv("HOME") : "~")
+                                        + "/.cache/ai-agent/venv/bin/python3";
+    static const std::string SCRIPT   = std::string(getenv("HOME") ? getenv("HOME") : "~")
+                                        + "/.cache/ai-agent/search.py";
+
+    auto r = impl_run_command(
+        VENV_PY + " " + shell_single_quote(SCRIPT)
+        + " " + shell_single_quote(query), ".");
+
+    try {
+        auto j = nlohmann::json::parse(r.output);
+        if (j.is_object() && j.contains("error"))
+            return {false, "search error: " + j["error"].get<std::string>()};
+        if (!j.is_array() || j.empty())
+            return {true, "No results found"};
+
+        std::string out;
+        for (const auto& item : j) {
+            const std::string title = item.value("title", "?");
+            const std::string url   = item.value("url", "");
+            std::string body        = item.value("body", "");
+            if (body.size() > 300) body = body.substr(0, 300) + "…";
+            out += "[" + title + "](" + url + ")\n";
+            if (!body.empty()) out += body + "\n";
+            out += "\n";
+        }
+        return {true, out};
+    } catch (...) {
+        return {false, "parse error: " + r.output.substr(0, 200)};
+    }
+}
+
+static ToolResult impl_fetch_url(const std::string& url) {
+    if (url.empty()) return {false, "missing: url"};
+    const std::string cmd =
+        "curl -sL --max-time 15 "
+        "-H " + shell_single_quote("User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/120") +
+        " " + shell_single_quote(url) +
+        " | sed 's/<[^>]*>//g' | sed '/^[[:space:]]*$/d' | head -c 5000";
+    return impl_run_command(cmd, ".");
+}
+
 // ── Registry ──────────────────────────────────────────────────────────────────
 
 void ToolRegistry::add(Tool tool) { tools_.push_back(std::move(tool)); }
@@ -199,6 +255,20 @@ ToolRegistry make_default_tools(const std::string& working_dir) {
                                           working_dir);
              }});
 
+    reg.add({"web_search",
+             "Search the web via SearXNG; returns titles, URLs, and snippets",
+             "{\"query\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_web_search(args.is_object() ? args.value("query", "") : "");
+             }});
+
+    reg.add({"fetch_url",
+             "Fetch a web page and return its text content (HTML stripped)",
+             "{\"url\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_fetch_url(args.is_object() ? args.value("url", "") : "");
+             }});
+
     return reg;
 }
 
@@ -227,6 +297,20 @@ ToolRegistry make_readonly_tools(const std::string& working_dir) {
                  return impl_search_files(args.value("pattern", ""),
                                           args.value("directory", "."),
                                           working_dir);
+             }});
+
+    reg.add({"web_search",
+             "Search the web via SearXNG; returns titles, URLs, and snippets",
+             "{\"query\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_web_search(args.is_object() ? args.value("query", "") : "");
+             }});
+
+    reg.add({"fetch_url",
+             "Fetch a web page and return its text content (HTML stripped)",
+             "{\"url\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_fetch_url(args.is_object() ? args.value("url", "") : "");
              }});
 
     return reg;

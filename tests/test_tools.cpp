@@ -162,6 +162,20 @@ static void test_unknown_tool(ToolRegistry& reg) {
     EXPECT_NE(r.output.find("unknown tool"), std::string::npos);
 }
 
+// ── web_search / fetch_url tests ─────────────────────────────────────────────
+
+static void test_web_search_missing_query(ToolRegistry& reg) {
+    auto r = reg.call("web_search", nlohmann::json::object());
+    EXPECT_TRUE(!r.success);
+    EXPECT_NE(r.output.find("missing"), std::string::npos);
+}
+
+static void test_fetch_url_missing_url(ToolRegistry& reg) {
+    auto r = reg.call("fetch_url", nlohmann::json::object());
+    EXPECT_TRUE(!r.success);
+    EXPECT_NE(r.output.find("missing"), std::string::npos);
+}
+
 // ── readonly registry ─────────────────────────────────────────────────────────
 
 static void test_readonly_no_write(const TmpDir& tmp) {
@@ -171,6 +185,8 @@ static void test_readonly_no_write(const TmpDir& tmp) {
     EXPECT_TRUE(reg.has("list_dir"));
     EXPECT_TRUE(reg.has("read_file"));
     EXPECT_TRUE(reg.has("search_files"));
+    EXPECT_TRUE(reg.has("web_search"));
+    EXPECT_TRUE(reg.has("fetch_url"));
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -196,6 +212,8 @@ int main() {
     test_run_command_pwd(reg, tmp);
 
     test_unknown_tool(reg);
+    test_web_search_missing_query(reg);
+    test_fetch_url_missing_url(reg);
     test_readonly_no_write(tmp);
 
     std::cout << "\nTools tests: " << passed << " passed, " << failed << " failed\n";

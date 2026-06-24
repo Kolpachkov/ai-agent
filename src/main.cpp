@@ -598,9 +598,18 @@ static void toggle_mouse() {
     g_mouse_on = !g_mouse_on;
     if (g_mouse_on) {
         mousemask(ALL_MOUSE_EVENTS|REPORT_MOUSE_POSITION, nullptr);
-        out_push("[mouse: on — колёсо работает, для копирования /mouse]\n");
+        // Disable alternate scroll mode so the terminal sends BUTTON4/5 events
+        // instead of converting wheel to KEY_UP/KEY_DOWN arrow sequences.
+        refresh();
+        fputs("\033[?1007l", stdout);
+        fflush(stdout);
+        out_push("[mouse: on — колёсо прокручивает, /mouse для копирования]\n");
     } else {
         mousemask(0, nullptr);
+        // Restore alternate scroll mode so wheel works without mouse capture.
+        refresh();
+        fputs("\033[?1007h", stdout);
+        fflush(stdout);
         out_push("[mouse: off — выделение и копирование работает, /mouse для колеса]\n");
     }
 }

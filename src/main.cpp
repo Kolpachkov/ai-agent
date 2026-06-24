@@ -18,6 +18,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <memory>
+#include <unistd.h>
+#include <fcntl.h>
 
 namespace fs = std::filesystem;
 
@@ -94,6 +96,18 @@ static int bytes_for_cols(const char* s, int len, int max_cols) {
         i += step; cols++;
     }
     return i;
+}
+
+// Word-aware chunk split: returns {bytes_to_display, bytes_to_advance}.
+// Tries to break at the last space within cw columns; falls back to hard break.
+static std::pair<int,int> word_chunk(const char* s, int len, int cw) {
+    const int raw = bytes_for_cols(s, len, cw);
+    if (raw >= len) return {raw, raw};          // last segment, no wrap
+    // Walk back within the raw chunk to find the last ASCII space
+    int sp = raw;
+    while (sp > 0 && (unsigned char)s[sp-1] != ' ') --sp;
+    if (sp > 0) return {sp - 1, sp};           // display up-to-space, advance past space
+    return {raw, raw};                          // no space found — hard break
 }
 
 
@@ -200,7 +214,7 @@ static void draw_header(AgentMode mode, const std::string& model_name) {
     std::string spin = g_generating ? std::string(" ")+SPINNER[g_spinner_frame%SPINNER_N] : "";
     std::string stag = (g_scroll_top >= 0) ? " [↑]" : "";
     std::string left = " ◆ ai-agent  |  " + std::string(ms) + spin + stag + "  |  " + model_name;
-    const std::string right = " PgUp/Dn: scroll  /mouse: колесо  ESC: стоп ";
+    const std::string right = " колесо: скрол  Shift+drag: копи  ESC: стоп ";
     const int pad = COLS - utf8_cols(left) - utf8_cols(right);
     for (int i=0; i<pad; ++i) left += ' ';
     left += right;
@@ -231,10 +245,10 @@ static void flush_output() {
         if (line.empty()) { vrows.push_back({"", cp}); continue; }
         int bp = 0, len = (int)line.size();
         while (bp < len) {
-            const int chunk = bytes_for_cols(line.c_str()+bp, len-bp, cw);
-            if (chunk == 0) break;
-            vrows.push_back({line.substr(bp, chunk), cp});
-            bp += chunk;
+            const auto [disp, adv] = word_chunk(line.c_str()+bp, len-bp, cw);
+            if (adv == 0) break;
+            vrows.push_back({line.substr(bp, disp), cp});
+            bp += adv;
         }
     }
 
@@ -592,25 +606,29 @@ static std::string cmd_model(const std::string& current_model) {
     return "";
 }
 
+// Write escape sequences directly to the terminal device, bypassing ncurses
+// and stdout buffering (ncurses may use a different internal stream).
+static void tty_write(const char* seq) {
+    int fd = open("/dev/tty", O_WRONLY | O_NOCTTY);
+    if (fd < 0) return;
+    write(fd, seq, strlen(seq));
+    close(fd);
+}
+
 // ── Mouse toggle ──────────────────────────────────────────────────────────────
-static bool g_mouse_on = false;
+// Mouse is ON by default (scroll wheel works). /mouse turns it OFF so the
+// terminal allows native drag-select; use Shift+drag when mouse is ON.
+static bool g_mouse_on = true;
 static void toggle_mouse() {
     g_mouse_on = !g_mouse_on;
     if (g_mouse_on) {
         mousemask(ALL_MOUSE_EVENTS|REPORT_MOUSE_POSITION, nullptr);
-        // Disable alternate scroll mode so the terminal sends BUTTON4/5 events
-        // instead of converting wheel to KEY_UP/KEY_DOWN arrow sequences.
-        refresh();
-        fputs("\033[?1007l", stdout);
-        fflush(stdout);
-        out_push("[mouse: on — колёсо прокручивает, /mouse для копирования]\n");
+        tty_write("\033[?1007l");  // disable alternate scroll → wheel gives BUTTON4/5 events
+        out_push("[mouse: on — колёсо прокручивает, Shift+drag для копирования]\n");
     } else {
         mousemask(0, nullptr);
-        // Restore alternate scroll mode so wheel works without mouse capture.
-        refresh();
-        fputs("\033[?1007h", stdout);
-        fflush(stdout);
-        out_push("[mouse: off — выделение и копирование работает, /mouse для колеса]\n");
+        tty_write("\033[?1007h");  // restore alternate scroll
+        out_push("[mouse: off — выделяй и копируй мышью, /mouse чтобы вернуть колесо]\n");
     }
 }
 
@@ -657,7 +675,7 @@ int main(int argc, char** argv) {
     setenv("ESCDELAY","25",1);
     initscr(); cbreak(); noecho(); curs_set(1);
     if (has_colors()){ start_color(); use_default_colors(); init_colors(); }
-    mousemask(0, nullptr);   // off by default — text selection works; /mouse toggles scroll
+    mousemask(ALL_MOUSE_EVENTS|REPORT_MOUSE_POSITION, nullptr);
     mouseinterval(0);
     std::signal(SIGWINCH, handle_sigwinch);
     create_windows();

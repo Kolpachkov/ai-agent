@@ -38,6 +38,7 @@ static constexpr int CP_DIM       = 8;
 static constexpr int CP_HDR_BUILD = 9;   // BUILD: dark on yellow
 static constexpr int CP_HDR_PLAN  = 10;  // PLAN:  dark on teal
 static constexpr int CP_HDR_LOOP  = 11;  // LOOP:  dark on green
+static constexpr int CP_BG        = 12;  // output window background fill
 
 static const char* SPINNER[]   = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
 static constexpr int SPINNER_N = 10;
@@ -49,6 +50,7 @@ static std::atomic<bool> g_generating{false};
 static std::atomic<bool> g_resize_pending{false};
 static int               g_spinner_frame{0};
 static int               g_scroll_top{-1};   // -1 = auto, >= 0 = frozen line
+static std::chrono::steady_clock::time_point g_gen_start;
 
 // autonomous loop: gen_thread sets g_loop_next when response contains <next>…</next>
 static std::atomic<bool>     g_loop_enabled{false};
@@ -198,6 +200,7 @@ static void init_colors() {
         init_pair(CP_HDR_BUILD, 235, 214);  // dark on Gruvbox yellow
         init_pair(CP_HDR_PLAN,  235,  66);  // dark on Gruvbox aqua
         init_pair(CP_HDR_LOOP,  235, 142);  // dark on Gruvbox green
+        init_pair(CP_BG,        223, 235);  // cream on Gruvbox dark bg
     } else {
         init_pair(CP_HEADER,    COLOR_BLACK,  COLOR_YELLOW);
         init_pair(CP_USER,      COLOR_YELLOW, -1);
@@ -210,6 +213,7 @@ static void init_colors() {
         init_pair(CP_HDR_BUILD, COLOR_BLACK,  COLOR_YELLOW);
         init_pair(CP_HDR_PLAN,  COLOR_BLACK,  COLOR_CYAN);
         init_pair(CP_HDR_LOOP,  COLOR_BLACK,  COLOR_GREEN);
+        init_pair(CP_BG,        -1,           COLOR_BLACK);
     }
 }
 
@@ -250,6 +254,7 @@ static void create_windows() {
     if (g_out_h < 1) g_out_h = 1;
     g_hdr = newwin(1, COLS, 0, 0);
     g_out = newwin(g_out_h, COLS, 1, 0);
+    if (has_colors()) wbkgd(g_out, COLOR_PAIR(CP_BG)); // opaque bg, no wallpaper bleed
     g_inp = newwin(1, COLS, LINES-1, 0);
     wtimeout(g_inp, 80);
     keypad(g_inp, TRUE);
@@ -276,7 +281,13 @@ static void draw_header(AgentMode mode, const std::string& model_name) {
     const attr_t ha = (has_colors() ? COLOR_PAIR(hdr_pair(mode)) : A_REVERSE) | A_BOLD;
     wbkgd(g_hdr, ha); wattron(g_hdr, ha);
     const char* ms = (mode == AgentMode::Plan) ? "PLAN" : "BUILD";
-    std::string spin = g_generating ? std::string(" ")+SPINNER[g_spinner_frame%SPINNER_N] : "";
+    std::string spin;
+    if (g_generating) {
+        const int secs = (int)std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - g_gen_start).count();
+        spin = std::string(" ") + SPINNER[g_spinner_frame%SPINNER_N];
+        if (secs >= 3) { spin += " "; spin += std::to_string(secs); spin += "с"; }
+    }
     std::string stag = (g_scroll_top >= 0) ? " [↑]" : "";
     std::string loop_tag = g_loop_enabled ? " ⟳" : "";
     std::string left = " ◆ ai-agent  |  " + std::string(ms) + loop_tag + spin + stag + "  |  " + model_name;
@@ -806,6 +817,7 @@ int main(int argc, char** argv) {
     auto make_gen_thread = [&](const std::string& input_line) -> std::thread {
         return std::thread([&, input_line]() {
             const auto t0 = std::chrono::steady_clock::now();
+            g_gen_start = t0;
             std::string full_resp;
             try {
                 auto stream_cb = [&](const std::string& piece) -> bool {

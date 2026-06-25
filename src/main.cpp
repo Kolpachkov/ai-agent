@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <memory>
 #include <unistd.h>
+#include <linux/limits.h>
 #include <fcntl.h>
 
 namespace fs = std::filesystem;
@@ -650,8 +651,28 @@ static void toggle_mouse() {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+// Return the directory of the running executable via /proc/self/exe.
+static fs::path exe_dir() {
+    char buf[PATH_MAX];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return fs::current_path();
+    buf[n] = '\0';
+    return fs::path(buf).parent_path();
+}
+
 int main(int argc, char** argv) {
-    std::string config_path = "./config.json";
+    // Default config: look for config.json next to the binary, then one level
+    // up (project root when binary lives in build/), then fall back to CWD.
+    std::string config_path;
+    {
+        const fs::path d = exe_dir();
+        // Prefer config.json in the project root (parent of build/) over any
+        // stale copy that might sit next to the binary in build/.
+        if      (fs::exists(d.parent_path() / "config.json")) config_path = (d.parent_path() / "config.json").string();
+        else if (fs::exists(d / "config.json"))               config_path = (d / "config.json").string();
+        else                                                   config_path = "./config.json";
+    }
+
     bool override_verbose=false, mode_override=false;
     AgentMode override_mode = AgentMode::Build;
 
@@ -668,6 +689,14 @@ int main(int argc, char** argv) {
     AppConfig cfg;
     try { cfg=load_config(config_path); }
     catch(const std::exception& e){ std::cerr<<"[error] "<<e.what()<<"\n"; return 1; }
+
+    // Resolve model path relative to config file's directory so relative
+    // paths in config.json work regardless of the working directory.
+    if (!cfg.model.path.empty() && !fs::path(cfg.model.path).is_absolute()) {
+        std::error_code ec;
+        const fs::path config_dir = fs::canonical(config_path, ec).parent_path();
+        if (!ec) cfg.model.path = (config_dir / cfg.model.path).lexically_normal().string();
+    }
     if (override_verbose) cfg.agent.verbose=true;
     if (mode_override)    cfg.agent.mode=override_mode;
 

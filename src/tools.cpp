@@ -385,6 +385,11 @@ std::string ToolRegistry::system_section() const {
        << "  <tool_call>{\"name\": \"diff_apply\", \"arguments\": {\"diff\": \"--- a/file.c\\n+++ b/file.c\\n@@ ... \"}}</tool_call>\n\n"
        << "NOTE: In write_file/edit_file, newlines in strings must be \\n (JSON escaped).\n"
        << "PREFER edit_file over write_file for changing existing files — it's safer and uses less context.\n\n"
+       << "AUTONOMOUS LOOP:\n"
+       << "To continue automatically after finishing a step, end your response with:\n"
+       << "  <next>description of the next step</next>\n"
+       << "The system will send it back as your next input automatically (user can interrupt with ESC).\n"
+       << "Omit <next> when the task is fully complete.\n\n"
        << "AVAILABLE TOOLS:\n";
     for (const auto& t : tools_)
         ss << "  " << t.name << " — " << t.description

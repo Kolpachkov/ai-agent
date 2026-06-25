@@ -47,6 +47,10 @@ static std::atomic<bool> g_resize_pending{false};
 static int               g_spinner_frame{0};
 static int               g_scroll_top{-1};   // -1 = auto, >= 0 = frozen line
 
+// autonomous loop: gen_thread sets g_loop_next when response contains <next>…</next>
+static std::string           g_loop_next;
+static std::mutex            g_loop_mu;
+
 // ask_user: agent thread sets g_ask_pending, main thread reads the question,
 // calls read_line_tui, stores answer, clears g_ask_pending, notifies CV.
 static std::atomic<bool>     g_ask_pending{false};
@@ -774,9 +778,71 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ── Gen-thread factory ────────────────────────────────────────────────────
+    // Defined here so it can be used both by the Enter handler and auto-loop.
+    auto make_gen_thread = [&](const std::string& input_line) -> std::thread {
+        return std::thread([&, input_line]() {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string full_resp;
+            try {
+                auto stream_cb = [&](const std::string& piece) -> bool {
+                    full_resp += piece;
+                    out_push(strip_ansi(piece));
+                    return !g_interrupted;
+                };
+                auto think_cb = [&]() { ++g_spinner_frame; };
+                agent->chat(input_line, stream_cb, think_cb);
+                out_push("\n");
+                agent->save_history();
+
+                // Extract <next>task</next> for autonomous loop
+                if (!g_interrupted) {
+                    const size_t ns = full_resp.find("<next>");
+                    const size_t ne = full_resp.find("</next>");
+                    if (ns != std::string::npos && ne != std::string::npos && ne > ns) {
+                        std::string task = full_resp.substr(ns + 6, ne - ns - 6);
+                        const size_t s = task.find_first_not_of(" \n\r\t");
+                        const size_t e = task.find_last_not_of(" \n\r\t");
+                        if (s != std::string::npos) {
+                            task = task.substr(s, e - s + 1);
+                            out_push("[⟳ авто: " + task + "]\n");
+                            std::lock_guard<std::mutex> lk(g_loop_mu);
+                            g_loop_next = task;
+                        }
+                    }
+                }
+            } catch(const std::exception& e) {
+                out_push("\n[error: "+std::string(e.what())+"]\n");
+            }
+            if (g_interrupted) { out_push("[interrupted]\n"); std::lock_guard<std::mutex> lk(g_loop_mu); g_loop_next.clear(); }
+            const double secs = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            char tbuf[48];
+            const int m = (int)(secs / 60);
+            if (m == 0) snprintf(tbuf, sizeof(tbuf), "  ╰─ %.1f с\n", secs);
+            else        snprintf(tbuf, sizeof(tbuf), "  ╰─ %d м %d с\n", m, (int)secs % 60);
+            out_push(tbuf);
+            g_generating=false; g_interrupted=false;
+        });
+    };
+
     // ── Main event loop ───────────────────────────────────────────────────────
     while (true) {
         if (g_resize_pending.exchange(false)) resize_windows();
+
+        // auto-loop: fire next task if agent left a <next> continuation
+        if (!g_generating && !g_interrupted) {
+            std::string next;
+            { std::lock_guard<std::mutex> lk(g_loop_mu); next = std::move(g_loop_next); }
+            if (!next.empty()) {
+                { std::lock_guard<std::mutex> lk(g_out_mu); g_scroll_top=-1; g_dirty=true; }
+                out_push("\n◆ [⟳ авто] " + next + "\n  ╰─ \n");
+                g_generating=true; g_interrupted=false;
+                if (gen_thread.joinable()) gen_thread.join();
+                gen_thread = make_gen_thread(next);
+                continue;
+            }
+        }
 
         // ask_user: agent thread is waiting — show question and read answer
         if (g_ask_pending.load()) {
@@ -896,31 +962,7 @@ int main(int argc, char** argv) {
 
             g_generating=true; g_interrupted=false;
             if (gen_thread.joinable()) gen_thread.join();
-
-            gen_thread = std::thread([&, line]() {
-                const auto t0 = std::chrono::steady_clock::now();
-                try {
-                    auto stream_cb = [&](const std::string& piece) -> bool {
-                        out_push(strip_ansi(piece));
-                        return !g_interrupted;
-                    };
-                    auto think_cb = [&]() { ++g_spinner_frame; };
-                    agent->chat(line, stream_cb, think_cb);
-                    out_push("\n");
-                    agent->save_history();
-                } catch(const std::exception& e) {
-                    out_push("\n[error: "+std::string(e.what())+"]\n");
-                }
-                if (g_interrupted) out_push("[interrupted]\n");
-                const double secs = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - t0).count();
-                char tbuf[48];
-                const int m = (int)(secs / 60);
-                if (m == 0) snprintf(tbuf, sizeof(tbuf), "  ╰─ %.1f с\n", secs);
-                else        snprintf(tbuf, sizeof(tbuf), "  ╰─ %d м %d с\n", m, (int)secs % 60);
-                out_push(tbuf);
-                g_generating=false; g_interrupted=false;
-            });
+            gen_thread = make_gen_thread(line);
             continue;
         }
 

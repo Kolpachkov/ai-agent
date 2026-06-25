@@ -254,7 +254,6 @@ static void create_windows() {
     if (g_out_h < 1) g_out_h = 1;
     g_hdr = newwin(1, COLS, 0, 0);
     g_out = newwin(g_out_h, COLS, 1, 0);
-    if (has_colors()) wbkgd(g_out, COLOR_PAIR(CP_BG)); // opaque bg, no wallpaper bleed
     g_inp = newwin(1, COLS, LINES-1, 0);
     wtimeout(g_inp, 80);
     keypad(g_inp, TRUE);

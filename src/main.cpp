@@ -157,6 +157,8 @@ static int line_cp(const std::string& line) {
     if (sw("  ⦿"))       return CP_TOOL;
     if (sw("  ✓"))       return CP_TOOL;
     if (sw("  ✗"))       return CP_ERROR;
+    if (sw("  ⊕"))       return CP_TOOL;   // diff: added line (green)
+    if (sw("  ⊖"))       return CP_ERROR;  // diff: removed line (red)
     if (sw("[thinking"))  return CP_THINK;
     if (sw("[error"))     return CP_ERROR;
     if (sw("[inter") || sw("[busy")) return CP_DIM;

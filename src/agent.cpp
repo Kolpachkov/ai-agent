@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unistd.h>
@@ -63,6 +64,8 @@ static std::string tool_summary(const std::string& name, const ToolResult& r) {
                ? std::to_string(bytes / 1024) + " KB" : std::to_string(bytes) + " B") + "\033[0m";
     if (name == "write_file")
         return "\033[32m✓\033[0m \033[2mwritten\033[0m";
+    if (name == "edit_file")
+        return "\033[32m✓\033[0m";
     if (name == "run_command")
         return "\033[32m✓\033[0m \033[2m" + std::to_string(lines) + " lines\033[0m";
     if (name == "search_files")
@@ -84,6 +87,8 @@ static std::string format_tool_line(const std::string& name,
         if (arg.size() > 45) arg = arg.substr(0, 42) + "…";
     } else if (name == "search_files")
         arg = "\"" + args.value("pattern", "?") + "\" in " + args.value("directory", ".");
+    else if (name == "edit_file" || name == "write_file")
+        arg = args.value("path", "?");
     else if (name == "web_search")
         arg = "\"" + args.value("query", "?") + "\"";
     else if (name == "fetch_url") {
@@ -91,9 +96,28 @@ static std::string format_tool_line(const std::string& name,
         if (arg.size() > 50) arg = arg.substr(0, 47) + "…";
     }
 
-    return "\n  \033[34m⦿\033[0m \033[1m" + name + "\033[0m"
-           "(\033[33m" + arg + "\033[0m)  "
-           + tool_summary(name, result) + "\n";
+    std::string out = "\n  \033[34m⦿\033[0m \033[1m" + name + "\033[0m"
+                      "(\033[33m" + arg + "\033[0m)  "
+                      + tool_summary(name, result) + "\n";
+
+    // For edit_file show a compact before/after diff (up to 8 lines each side)
+    if (name == "edit_file" && result.success) {
+        const std::string old_s = args.value("old_string", "");
+        const std::string new_s = args.value("new_string", "");
+        auto append_lines = [&](const std::string& s, const char* prefix, int limit) {
+            std::istringstream ss(s);
+            std::string ln;
+            int n = 0;
+            while (std::getline(ss, ln) && n < limit) {
+                if (!ln.empty() || n > 0) { out += prefix + ln + "\n"; ++n; }
+            }
+            if (!ss.eof()) out += std::string(prefix) + "…\n";
+        };
+        append_lines(old_s, "  \342\212\226 ", 6); // ⊖ U+2296 (red in TUI)
+        append_lines(new_s, "  \342\212\225 ", 6); // ⊕ U+2295 (green in TUI)
+    }
+
+    return out;
 }
 
 // ── Private implementation ────────────────────────────────────────────────────

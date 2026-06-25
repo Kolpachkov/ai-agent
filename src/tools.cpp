@@ -469,8 +469,13 @@ ToolRegistry make_default_tools(const std::string& working_dir) {
              "Replace an exact string in a file (fails if old_str not found or not unique)",
              "{\"path\": \"string\", \"old_str\": \"string\", \"new_str\": \"string\"}",
              [working_dir](const nlohmann::json& args) {
+                 // accept both old_str and old_string (model uses both conventions)
+                 std::string old_s = args.value("old_str", "");
+                 if (old_s.empty()) old_s = args.value("old_string", "");
+                 std::string new_s = args.value("new_str", "");
+                 if (new_s.empty() && args.contains("new_string")) new_s = args.value("new_string", "");
                  return impl_edit_file(resolve_path(args.value("path", ""), working_dir),
-                                       args.value("old_str", ""), args.value("new_str", ""));
+                                       old_s, new_s);
              }});
 
     reg.add({"python_eval",

@@ -114,8 +114,11 @@ static std::string format_tool_line(const std::string& name,
 
     // For edit_file show a compact before/after diff (up to 8 lines each side)
     if (name == "edit_file" && result.success) {
-        const std::string old_s = args.value("old_string", "");
-        const std::string new_s = args.value("new_string", "");
+        // model may use old_str or old_string — accept both
+        std::string old_s = args.value("old_str", "");
+        if (old_s.empty()) old_s = args.value("old_string", "");
+        std::string new_s = args.value("new_str", "");
+        if (new_s.empty() && args.contains("new_string")) new_s = args.value("new_string", "");
         auto append_lines = [&](const std::string& s, const char* prefix, int limit) {
             std::istringstream ss(s);
             std::string ln;

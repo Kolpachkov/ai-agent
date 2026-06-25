@@ -750,6 +750,8 @@ int main(int argc, char** argv) {
     }
     if (override_verbose) cfg.agent.verbose=true;
     if (mode_override)    cfg.agent.mode=override_mode;
+    // Always operate in the directory where the binary was invoked
+    cfg.tools.working_dir = fs::current_path().string();
 
     // Create sessions dir early (silent)
     const std::string sessions_dir_exp = expand_home(cfg.agent.sessions_dir);
@@ -796,24 +798,8 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, handle_sigint);
 
-    // ── TUI: session selection ────────────────────────────────────────────────
-    if (!cfg.agent.sessions_dir.empty()) {
-        const auto sessions = scan_sessions(cfg.agent.sessions_dir);
-        if (!sessions.empty()) {
-            draw_header(agent->mode(), model_name);
-            const int choice = tui_pick_session(sessions);
-            // Clear selection menu from output, then show history or new-session banner
-            { std::lock_guard<std::mutex> lk(g_out_mu); g_lines.clear(); g_dirty=true; }
-            if (choice>0 && choice<=(int)sessions.size()) {
-                agent->set_session_path(sessions[choice-1].path);
-                agent->load_session(sessions[choice-1].path);
-                session_named = true;
-                display_session_history(sessions[choice-1].path);
-            } else {
-                out_push("\n  [новая сессия]\n\n");
-            }
-        }
-    }
+    // Always start a fresh session (no selection menu)
+    out_push("\n  ◆ " + fs::current_path().string() + "\n\n");
 
     // ── Gen-thread factory ────────────────────────────────────────────────────
     // Defined here so it can be used both by the Enter handler and auto-loop.

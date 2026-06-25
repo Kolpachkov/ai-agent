@@ -478,7 +478,7 @@ static std::vector<SessionEntry> scan_sessions(const std::string& dir_raw) {
             if (msg.value("role","")=="user") {
                 std::string t=msg.value("content","");
                 while (!t.empty()&&(t.back()=='\n'||t.back()=='\r')) t.pop_back();
-                se.title = utf8_trunc(t, 48); break;
+                se.title = utf8_trunc(t, 42); break;
             }
         }
         if (se.title.empty()) se.title=e.path().stem().string();
@@ -523,14 +523,14 @@ static void display_session_history(const std::string& path) {
 // ── Session selection (runs inside TUI) ───────────────────────────────────────
 static int tui_pick_session(const std::vector<SessionEntry>& sessions) {
     std::string s = "\n  ╔══ Сессии ══════════════════════════════════════════════╗\n";
-    s += "  ║  [0]  " + utf8_pad("новая сессия", 55) + "║\n";
+    s += "  ║  [0]  " + utf8_pad("новая сессия", 49) + "║\n";
     for (int i=0; i<(int)sessions.size(); ++i) {
         char buf[64];
         snprintf(buf, sizeof(buf), "  (%2d) ║", sessions[i].count);
         s += "  ║  [" + std::to_string(i+1) + "]  "
-           + utf8_pad(sessions[i].title, 48) + buf + "\n";
+           + utf8_pad(sessions[i].title, 42) + buf + "\n";
     }
-    s += "  ╚═════════════════════════════════════════════════════════╝\n";
+    s += "  ╚════════════════════════════════════════════════════════╝\n";
     out_push(s);
     const std::string ans = read_line_tui("  номер или Enter для новой: ");
     out_push("\n");

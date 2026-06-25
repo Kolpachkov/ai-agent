@@ -65,3 +65,17 @@ target_link_libraries(test_tools PRIVATE nlohmann_json::nlohmann_json)
 target_compile_options(test_tools PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-O0 -g -Wall -Wextra>)
 add_test(NAME test_tools COMMAND test_tools)
+
+# Headless agent smoke-tests (requires model, not run in CI by default)
+add_executable(test_headless tests/test_headless.cpp
+    src/agent.cpp src/config.cpp src/tools.cpp)
+target_include_directories(test_headless PRIVATE src/)
+target_link_libraries(test_headless PRIVATE
+    llama nlohmann_json::nlohmann_json ${CURSES_LIBRARIES})
+target_include_directories(test_headless PRIVATE ${CURSES_INCLUDE_DIRS})
+target_compile_options(test_headless PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-O0 -g -Wall -Wextra>)
+set_target_properties(test_headless PROPERTIES
+    BUILD_RPATH "$ENV{HOME}/llama.cpp-cuda/build/bin"
+    INSTALL_RPATH "$ENV{HOME}/llama.cpp-cuda/build/bin"
+    BUILD_RPATH_USE_ORIGIN ON)

@@ -139,8 +139,11 @@ static std::pair<int,int> word_chunk(const char* s, int len, int cw) {
     // Walk back within the raw chunk to find the last ASCII space
     int sp = raw;
     while (sp > 0 && (unsigned char)s[sp-1] != ' ') --sp;
-    if (sp > 0) return {sp - 1, sp};           // display up-to-space, advance past space
-    return {raw, raw};                          // no space found — hard break
+    int display = (sp > 0) ? sp - 1 : raw;
+    int advance = (sp > 0) ? sp     : raw;
+    // Skip all consecutive spaces so the next chunk never starts with one
+    while (advance < len && s[advance] == ' ') advance++;
+    return {display, advance};
 }
 
 

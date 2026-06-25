@@ -27,14 +27,17 @@
 namespace fs = std::filesystem;
 
 // ── Color pairs (Gruvbox dark) ────────────────────────────────────────────────
-static constexpr int CP_HEADER = 1;
-static constexpr int CP_USER   = 2;
-static constexpr int CP_RESP   = 3;
-static constexpr int CP_TOOL   = 4;
-static constexpr int CP_THINK  = 5;
-static constexpr int CP_STATUS = 6;
-static constexpr int CP_ERROR  = 7;
-static constexpr int CP_DIM    = 8;
+static constexpr int CP_HEADER    = 1;
+static constexpr int CP_USER      = 2;
+static constexpr int CP_RESP      = 3;
+static constexpr int CP_TOOL      = 4;
+static constexpr int CP_THINK     = 5;
+static constexpr int CP_STATUS    = 6;
+static constexpr int CP_ERROR     = 7;
+static constexpr int CP_DIM       = 8;
+static constexpr int CP_HDR_BUILD = 9;   // BUILD: dark on yellow
+static constexpr int CP_HDR_PLAN  = 10;  // PLAN:  dark on teal
+static constexpr int CP_HDR_LOOP  = 11;  // LOOP:  dark on green
 
 static const char* SPINNER[]   = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
 static constexpr int SPINNER_N = 10;
@@ -172,23 +175,29 @@ static int line_cp(const std::string& line) {
 static void init_colors() {
     if (!has_colors()) return;
     if (COLORS >= 256) {
-        init_pair(CP_HEADER, 235, 214);
-        init_pair(CP_USER,   214, -1);
-        init_pair(CP_RESP,   223, -1);
-        init_pair(CP_TOOL,   108, -1);
-        init_pair(CP_THINK,  175, -1);
-        init_pair(CP_STATUS, 142, -1);
-        init_pair(CP_ERROR,  167, -1);
-        init_pair(CP_DIM,    245, -1);
+        init_pair(CP_HEADER,    235, 214);
+        init_pair(CP_USER,      214,  -1);
+        init_pair(CP_RESP,      223,  -1);
+        init_pair(CP_TOOL,      108,  -1);
+        init_pair(CP_THINK,     175,  -1);
+        init_pair(CP_STATUS,    142,  -1);
+        init_pair(CP_ERROR,     167,  -1);
+        init_pair(CP_DIM,       245,  -1);
+        init_pair(CP_HDR_BUILD, 235, 214);  // dark on Gruvbox yellow
+        init_pair(CP_HDR_PLAN,  235,  66);  // dark on Gruvbox aqua
+        init_pair(CP_HDR_LOOP,  235, 142);  // dark on Gruvbox green
     } else {
-        init_pair(CP_HEADER, COLOR_BLACK,  COLOR_YELLOW);
-        init_pair(CP_USER,   COLOR_YELLOW, -1);
-        init_pair(CP_RESP,   -1,           -1);
-        init_pair(CP_TOOL,   COLOR_GREEN,  -1);
-        init_pair(CP_THINK,  COLOR_CYAN,   -1);
-        init_pair(CP_STATUS, COLOR_GREEN,  -1);
-        init_pair(CP_ERROR,  COLOR_RED,    -1);
-        init_pair(CP_DIM,    COLOR_WHITE,  -1);
+        init_pair(CP_HEADER,    COLOR_BLACK,  COLOR_YELLOW);
+        init_pair(CP_USER,      COLOR_YELLOW, -1);
+        init_pair(CP_RESP,      -1,           -1);
+        init_pair(CP_TOOL,      COLOR_GREEN,  -1);
+        init_pair(CP_THINK,     COLOR_CYAN,   -1);
+        init_pair(CP_STATUS,    COLOR_GREEN,  -1);
+        init_pair(CP_ERROR,     COLOR_RED,    -1);
+        init_pair(CP_DIM,       COLOR_WHITE,  -1);
+        init_pair(CP_HDR_BUILD, COLOR_BLACK,  COLOR_YELLOW);
+        init_pair(CP_HDR_PLAN,  COLOR_BLACK,  COLOR_CYAN);
+        init_pair(CP_HDR_LOOP,  COLOR_BLACK,  COLOR_GREEN);
     }
 }
 
@@ -243,10 +252,16 @@ static void resize_windows() {
     create_windows(); g_dirty = true;
 }
 
+static int hdr_pair(AgentMode mode) {
+    if (g_loop_enabled)               return CP_HDR_LOOP;
+    if (mode == AgentMode::Plan)      return CP_HDR_PLAN;
+    return CP_HDR_BUILD;
+}
+
 static void draw_header(AgentMode mode, const std::string& model_name) {
     if (!g_hdr) return;
     werase(g_hdr);
-    const attr_t ha = (has_colors() ? COLOR_PAIR(CP_HEADER) : A_REVERSE) | A_BOLD;
+    const attr_t ha = (has_colors() ? COLOR_PAIR(hdr_pair(mode)) : A_REVERSE) | A_BOLD;
     wbkgd(g_hdr, ha); wattron(g_hdr, ha);
     const char* ms = (mode == AgentMode::Plan) ? "PLAN" : "BUILD";
     std::string spin = g_generating ? std::string(" ")+SPINNER[g_spinner_frame%SPINNER_N] : "";
@@ -389,22 +404,25 @@ struct InputState {
 
 static constexpr int PFX_COLS = 4; // "◆ > "
 
-static void draw_input(InputState& inp) {
+static void draw_input(InputState& inp, AgentMode mode) {
     if (!g_inp) return;
     werase(g_inp);
+    const attr_t ba = has_colors() ? (COLOR_PAIR(hdr_pair(mode)) | A_BOLD) : A_BOLD;
+    wbkgd(g_inp, ba);
+    wattron(g_inp, ba);
     const int avail = COLS - PFX_COLS;
-    if (avail <= 0) { wrefresh(g_inp); return; }
+    if (avail <= 0) { wattroff(g_inp, ba); wrefresh(g_inp); return; }
     const int cur_col = inp.cols_to(inp.buf, inp.cursor);
     if (cur_col < inp.view_col) inp.view_col = cur_col;
     else if (cur_col >= inp.view_col+avail) inp.view_col = cur_col-avail+1;
     int vbyte = 0;
     for (int vc=0; vc<inp.view_col && vbyte<(int)inp.buf.size(); ++vc)
         vbyte = inp.next_utf8(inp.buf, vbyte);
-    const attr_t pa = has_colors() ? (COLOR_PAIR(CP_USER)|A_BOLD) : A_BOLD;
-    wattron(g_inp, pa); mvwaddstr(g_inp, 0, 0, "◆ > "); wattroff(g_inp, pa);
+    mvwaddstr(g_inp, 0, 0, "◆ > ");
     int ebyte=vbyte, cw=0;
     while (ebyte<(int)inp.buf.size() && cw<avail){ ebyte=inp.next_utf8(inp.buf,ebyte); ++cw; }
     if (vbyte<ebyte) waddnstr(g_inp, inp.buf.c_str()+vbyte, ebyte-vbyte);
+    wattroff(g_inp, ba);
     wmove(g_inp, 0, PFX_COLS+cur_col-inp.view_col);
     wrefresh(g_inp);
 }
@@ -762,7 +780,7 @@ int main(int argc, char** argv) {
 
     draw_header(agent->mode(), model_name);
     flush_output();
-    draw_input(inp);
+    draw_input(inp, agent->mode());
 
     std::signal(SIGINT, handle_sigint);
 
@@ -856,7 +874,7 @@ int main(int argc, char** argv) {
             std::string q;
             { std::lock_guard<std::mutex> lk(g_ask_mu); q = g_ask_question; }
             out_push("\n◆ [вопрос агента] " + q + "\n");
-            flush_output(); draw_header(agent->mode(), model_name); draw_input(inp);
+            flush_output(); draw_header(agent->mode(), model_name); draw_input(inp, agent->mode());
             const std::string ans = read_line_tui("  ответ: ");
             out_push("  ответ: " + ans + "\n\n");
             { std::lock_guard<std::mutex> lk(g_ask_mu); g_ask_answer = ans; }
@@ -866,7 +884,7 @@ int main(int argc, char** argv) {
 
         flush_output();
         draw_header(agent->mode(), model_name);
-        draw_input(inp);
+        draw_input(inp, agent->mode());
 
         const int ch = wgetch(g_inp);
 

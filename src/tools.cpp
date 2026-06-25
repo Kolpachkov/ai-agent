@@ -224,6 +224,127 @@ static ToolResult impl_fetch_url(const std::string& url) {
     return impl_run_command(cmd, ".");
 }
 
+// ── edit_file ─────────────────────────────────────────────────────────────────
+
+static ToolResult impl_edit_file(const std::string& path,
+                                  const std::string& old_str,
+                                  const std::string& new_str) {
+    if (old_str.empty()) return {false, "old_str cannot be empty"};
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin.is_open()) return {false, "cannot open: " + path};
+    std::ostringstream ss; ss << fin.rdbuf();
+    std::string content = ss.str();
+    fin.close();
+
+    const size_t pos = content.find(old_str);
+    if (pos == std::string::npos) return {false, "old_str not found in: " + path};
+    if (content.find(old_str, pos + 1) != std::string::npos)
+        return {false, "old_str found multiple times — add more context to make it unique"};
+
+    content.replace(pos, old_str.size(), new_str);
+    std::ofstream fout(path, std::ios::binary);
+    if (!fout.is_open()) return {false, "cannot write: " + path};
+    fout << content;
+    return {true, "edited " + path};
+}
+
+// ── python_eval ───────────────────────────────────────────────────────────────
+
+static ToolResult impl_python_eval(const std::string& code, const std::string& working_dir) {
+    const std::string tmp = "/tmp/ai_agent_eval_" + std::to_string(getpid()) + ".py";
+    { std::ofstream f(tmp); if (!f) return {false, "cannot write temp script"}; f << code; }
+    auto r = impl_run_command("python3 " + shell_single_quote(tmp), working_dir);
+    std::remove(tmp.c_str());
+    return r;
+}
+
+// ── memory ────────────────────────────────────────────────────────────────────
+
+static std::string memory_path() {
+    const char* h = getenv("HOME");
+    return std::string(h ? h : "~") + "/.cache/ai-agent/memory.json";
+}
+
+static ToolResult impl_memory_set(const std::string& key, const std::string& value) {
+    if (key.empty()) return {false, "key cannot be empty"};
+    const std::string path = memory_path();
+    nlohmann::json j = nlohmann::json::object();
+    { std::ifstream f(path); if (f.is_open()) { try { j = nlohmann::json::parse(f); } catch(...){} } }
+    j[key] = value;
+    fs::create_directories(fs::path(path).parent_path());
+    std::ofstream f(path);
+    if (!f) return {false, "cannot write memory file"};
+    f << j.dump(2);
+    return {true, "memory[" + key + "] set"};
+}
+
+static ToolResult impl_memory_get(const std::string& key) {
+    const std::string path = memory_path();
+    std::ifstream f(path);
+    if (!f.is_open()) return {true, key.empty() ? "{}" : "(not set)"};
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(f); } catch(...) { return {false, "memory file corrupt"}; }
+    if (key.empty()) return {true, j.dump(2)};
+    if (!j.contains(key)) return {true, "(not set)"};
+    return {true, j[key].get<std::string>()};
+}
+
+// ── diff_apply ────────────────────────────────────────────────────────────────
+
+static ToolResult impl_diff_apply(const std::string& diff, const std::string& working_dir) {
+    if (diff.empty()) return {false, "diff is empty"};
+    const std::string tmp = "/tmp/ai_agent_" + std::to_string(getpid()) + ".patch";
+    { std::ofstream f(tmp); if (!f) return {false, "cannot write patch file"}; f << diff; }
+    auto r = impl_run_command("patch -p1 < " + shell_single_quote(tmp), working_dir);
+    std::remove(tmp.c_str());
+    return r;
+}
+
+// ── tree ──────────────────────────────────────────────────────────────────────
+
+static ToolResult impl_tree(const std::string& path, int max_depth, const std::string& working_dir) {
+    const std::string abs = resolve_path(path, working_dir);
+    const std::string depth_arg = std::to_string(std::max(1, std::min(max_depth, 10)));
+    const std::string cmd =
+        "find " + shell_single_quote(abs) + " -maxdepth " + depth_arg +
+        " | sort | sed 's|" + abs + "||' | sed '/^$/d' | head -300";
+    return impl_run_command(cmd, working_dir);
+}
+
+// ── http_request ──────────────────────────────────────────────────────────────
+
+static ToolResult impl_http_request(const std::string& method, const std::string& url,
+                                     const std::string& body, const std::string& content_type) {
+    if (url.empty()) return {false, "url is required"};
+    std::string cmd = "curl -sL --max-time 20 -X " + shell_single_quote(method)
+                    + " -H " + shell_single_quote("User-Agent: Mozilla/5.0");
+    if (!body.empty()) {
+        const std::string ct = content_type.empty() ? "application/json" : content_type;
+        cmd += " -H " + shell_single_quote("Content-Type: " + ct)
+             + " -d " + shell_single_quote(body);
+    }
+    cmd += " " + shell_single_quote(url);
+    return impl_run_command(cmd, ".");
+}
+
+// ── notify ────────────────────────────────────────────────────────────────────
+
+static ToolResult impl_notify(const std::string& title, const std::string& body) {
+    return impl_run_command(
+        "notify-send " + shell_single_quote(title) + " " + shell_single_quote(body), ".");
+}
+
+// ── ask_user ──────────────────────────────────────────────────────────────────
+
+static std::function<std::string(const std::string&)> g_ask_user_fn;
+void set_ask_user_fn(std::function<std::string(const std::string&)> fn) { g_ask_user_fn = fn; }
+
+static ToolResult impl_ask_user(const std::string& question) {
+    if (!g_ask_user_fn) return {false, "ask_user not available"};
+    const std::string answer = g_ask_user_fn(question);
+    return {true, answer.empty() ? "(no answer)" : answer};
+}
+
 // ── Registry ──────────────────────────────────────────────────────────────────
 
 void ToolRegistry::add(Tool tool) { tools_.push_back(std::move(tool)); }
@@ -248,12 +369,22 @@ std::string ToolRegistry::system_section() const {
        << "EXAMPLES:\n"
        << "  <tool_call>{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}</tool_call>\n"
        << "  <tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"./src/main.cpp\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"edit_file\", \"arguments\": {\"path\": \"./src/main.cpp\", \"old_str\": \"int x = 1;\", \"new_str\": \"int x = 2;\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"./out.txt\", \"content\": \"line1\\nline2\\n\"}}</tool_call>\n"
        << "  <tool_call>{\"name\": \"run_command\", \"arguments\": {\"command\": \"gcc --version\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"python_eval\", \"arguments\": {\"code\": \"print(2**32)\"}}</tool_call>\n"
        << "  <tool_call>{\"name\": \"search_files\", \"arguments\": {\"pattern\": \"TODO\", \"directory\": \"./src\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"tree\", \"arguments\": {\"path\": \".\", \"max_depth\": 3}}</tool_call>\n"
        << "  <tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"cmake find_package tutorial\"}}</tool_call>\n"
        << "  <tool_call>{\"name\": \"fetch_url\", \"arguments\": {\"url\": \"https://example.com\"}}</tool_call>\n"
-       << "  <tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"./out.txt\", \"content\": \"line1\\nline2\\n\"}}</tool_call>\n\n"
-       << "NOTE: In write_file \"content\", newlines must be written as \\n (JSON escaped).\n\n"
+       << "  <tool_call>{\"name\": \"http_request\", \"arguments\": {\"method\": \"POST\", \"url\": \"https://api.example.com/data\", \"body\": \"{\\\"key\\\": \\\"value\\\"}\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"memory_set\", \"arguments\": {\"key\": \"project_notes\", \"value\": \"...\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"memory_get\", \"arguments\": {\"key\": \"project_notes\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"ask_user\", \"arguments\": {\"question\": \"Какой файл редактировать?\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"notify\", \"arguments\": {\"title\": \"Готово\", \"body\": \"Сборка завершена\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"diff_apply\", \"arguments\": {\"diff\": \"--- a/file.c\\n+++ b/file.c\\n@@ ... \"}}</tool_call>\n\n"
+       << "NOTE: In write_file/edit_file, newlines in strings must be \\n (JSON escaped).\n"
+       << "PREFER edit_file over write_file for changing existing files — it's safer and uses less context.\n\n"
        << "AVAILABLE TOOLS:\n";
     for (const auto& t : tools_)
         ss << "  " << t.name << " — " << t.description
@@ -323,6 +454,72 @@ ToolRegistry make_default_tools(const std::string& working_dir) {
              "{\"url\": \"string\"}",
              [](const nlohmann::json& args) {
                  return impl_fetch_url(args.is_object() ? args.value("url", "") : "");
+             }});
+
+    reg.add({"edit_file",
+             "Replace an exact string in a file (fails if old_str not found or not unique)",
+             "{\"path\": \"string\", \"old_str\": \"string\", \"new_str\": \"string\"}",
+             [working_dir](const nlohmann::json& args) {
+                 return impl_edit_file(resolve_path(args.value("path", ""), working_dir),
+                                       args.value("old_str", ""), args.value("new_str", ""));
+             }});
+
+    reg.add({"python_eval",
+             "Execute Python 3 code and return stdout/stderr",
+             "{\"code\": \"string\"}",
+             [working_dir](const nlohmann::json& args) {
+                 return impl_python_eval(args.value("code", ""), working_dir);
+             }});
+
+    reg.add({"memory_set",
+             "Persist a key-value pair across sessions (~/.cache/ai-agent/memory.json)",
+             "{\"key\": \"string\", \"value\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_memory_set(args.value("key", ""), args.value("value", ""));
+             }});
+
+    reg.add({"memory_get",
+             "Read a persisted value (omit key to dump all memory)",
+             "{\"key\": \"string\"}  (key optional)",
+             [](const nlohmann::json& args) {
+                 return impl_memory_get(args.value("key", ""));
+             }});
+
+    reg.add({"diff_apply",
+             "Apply a unified diff (patch -p1) in the working directory",
+             "{\"diff\": \"string\"}",
+             [working_dir](const nlohmann::json& args) {
+                 return impl_diff_apply(args.value("diff", ""), working_dir);
+             }});
+
+    reg.add({"tree",
+             "Show directory tree up to max_depth levels (default 3)",
+             "{\"path\": \"string\", \"max_depth\": number}",
+             [working_dir](const nlohmann::json& args) {
+                 return impl_tree(args.value("path", "."),
+                                  args.value("max_depth", 3), working_dir);
+             }});
+
+    reg.add({"http_request",
+             "Make an HTTP request (GET/POST/PUT/DELETE) and return the response body",
+             "{\"method\": \"GET|POST|PUT|DELETE\", \"url\": \"string\", \"body\": \"string\", \"content_type\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_http_request(args.value("method", "GET"), args.value("url", ""),
+                                          args.value("body", ""), args.value("content_type", ""));
+             }});
+
+    reg.add({"notify",
+             "Send a desktop notification (notify-send)",
+             "{\"title\": \"string\", \"body\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_notify(args.value("title", "ai-agent"), args.value("body", ""));
+             }});
+
+    reg.add({"ask_user",
+             "Pause and ask the user a question; returns their typed answer",
+             "{\"question\": \"string\"}",
+             [](const nlohmann::json& args) {
+                 return impl_ask_user(args.value("question", ""));
              }});
 
     return reg;

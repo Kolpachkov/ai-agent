@@ -1,5 +1,6 @@
 #include "agent.hpp"
 #include "config.hpp"
+#include "tools.hpp"
 
 #include <nlohmann/json.hpp>
 #include <ncurses.h>
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <deque>
 #include <vector>
 #include <chrono>
@@ -44,6 +46,14 @@ static std::atomic<bool> g_generating{false};
 static std::atomic<bool> g_resize_pending{false};
 static int               g_spinner_frame{0};
 static int               g_scroll_top{-1};   // -1 = auto, >= 0 = frozen line
+
+// ask_user: agent thread sets g_ask_pending, main thread reads the question,
+// calls read_line_tui, stores answer, clears g_ask_pending, notifies CV.
+static std::atomic<bool>     g_ask_pending{false};
+static std::string           g_ask_question;
+static std::string           g_ask_answer;
+static std::mutex            g_ask_mu;
+static std::condition_variable g_ask_cv;
 
 static void handle_sigwinch(int) { g_resize_pending = true; }
 static void handle_sigint(int)   { g_interrupted = true; }
@@ -715,6 +725,13 @@ int main(int argc, char** argv) {
     try { agent = std::make_unique<Agent>(cfg); }
     catch(const std::exception& e){ std::cerr<<"[error] "<<e.what()<<"\n"; return 1; }
     set_stop_flag(&g_interrupted);
+    set_ask_user_fn([](const std::string& question) -> std::string {
+        { std::lock_guard<std::mutex> lk(g_ask_mu); g_ask_question = question; g_ask_answer.clear(); }
+        g_ask_pending.store(true);
+        std::unique_lock<std::mutex> lk(g_ask_mu);
+        g_ask_cv.wait(lk, []{ return !g_ask_pending.load(); });
+        return g_ask_answer;
+    });
     std::cerr<<"[info] Ready.\n";
 
     // ── ncurses ───────────────────────────────────────────────────────────────
@@ -760,6 +777,19 @@ int main(int argc, char** argv) {
     // ── Main event loop ───────────────────────────────────────────────────────
     while (true) {
         if (g_resize_pending.exchange(false)) resize_windows();
+
+        // ask_user: agent thread is waiting — show question and read answer
+        if (g_ask_pending.load()) {
+            std::string q;
+            { std::lock_guard<std::mutex> lk(g_ask_mu); q = g_ask_question; }
+            out_push("\n◆ [вопрос агента] " + q + "\n");
+            flush_output(); draw_header(agent->mode(), model_name); draw_input(inp);
+            const std::string ans = read_line_tui("  ответ: ");
+            out_push("  ответ: " + ans + "\n\n");
+            { std::lock_guard<std::mutex> lk(g_ask_mu); g_ask_answer = ans; }
+            g_ask_pending.store(false);
+            g_ask_cv.notify_one();
+        }
 
         flush_output();
         draw_header(agent->mode(), model_name);

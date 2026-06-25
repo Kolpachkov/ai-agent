@@ -83,11 +83,23 @@ static void out_push(const std::string& text) {
 
 // ── UTF-8 helpers ─────────────────────────────────────────────────────────────
 static std::string strip_ansi(const std::string& s) {
-    std::string r; bool esc = false;
+    std::string r;
     for (size_t i = 0; i < s.size(); ++i) {
-        if (esc) { if ((s[i]>='A'&&s[i]<='Z')||(s[i]>='a'&&s[i]<='z')) esc=false; }
-        else if (s[i]=='\033' && i+1<s.size() && s[i+1]=='[') { esc=true; ++i; }
-        else r += s[i];
+        if (s[i] != '\033') { r += s[i]; continue; }
+        if (i + 1 >= s.size()) break;
+        const char next = s[++i];
+        if (next == '[') {
+            // CSI: consume until final byte [0x40–0x7E]
+            while (i + 1 < s.size()) {
+                const unsigned char c = (unsigned char)s[++i];
+                if (c >= 0x40 && c <= 0x7E) break;
+            }
+        } else if (next == ']') {
+            // OSC: consume until BEL or ST
+            while (i + 1 < s.size() && s[i+1] != '\007' && s[i+1] != '\033') ++i;
+            if (i + 1 < s.size() && s[i+1] == '\007') ++i;
+        }
+        // else: two-char ESC sequence — both already consumed (ESC + next)
     }
     return r;
 }
@@ -406,9 +418,9 @@ static constexpr int PFX_COLS = 4; // "◆ > "
 
 static void draw_input(InputState& inp, AgentMode mode) {
     if (!g_inp) return;
-    werase(g_inp);
     const attr_t ba = has_colors() ? (COLOR_PAIR(hdr_pair(mode)) | A_BOLD) : A_BOLD;
-    wbkgd(g_inp, ba);
+    wbkgd(g_inp, ba);   // must be before werase so erase fills with mode color
+    werase(g_inp);
     wattron(g_inp, ba);
     const int avail = COLS - PFX_COLS;
     if (avail <= 0) { wattroff(g_inp, ba); wrefresh(g_inp); return; }

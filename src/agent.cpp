@@ -49,10 +49,25 @@ static inline std::string extract_between(const std::string& s,
     return parsing_extract_between(s, open, close);
 }
 
+// ── UTF-8 aware truncation (no byte-boundary splits) ─────────────────────────
+static std::string utf8_trunc(const std::string& s, int max_chars) {
+    int n = 0; size_t i = 0;
+    while (i < s.size() && n < max_chars) {
+        unsigned char c = (unsigned char)s[i];
+        i += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+        ++n;
+    }
+    return (i >= s.size()) ? s : s.substr(0, i) + "…";
+}
+
 // ── Tool call display (Claude Code style) ────────────────────────────────────
 static std::string tool_summary(const std::string& name, const ToolResult& r) {
     if (!r.success) {
-        std::string msg = r.output.size() > 60 ? r.output.substr(0, 57) + "…" : r.output;
+        // First line of error only, then truncate
+        std::string msg = r.output;
+        const auto nl = msg.find('\n');
+        if (nl != std::string::npos) msg = msg.substr(0, nl);
+        msg = utf8_trunc(msg, 50);
         return "\033[31m✗\033[0m \033[2m" + msg + "\033[0m";
     }
     int lines = (int)std::count(r.output.begin(), r.output.end(), '\n');
@@ -83,18 +98,15 @@ static std::string format_tool_line(const std::string& name,
     else if (name == "list_dir")
         arg = args.value("path", ".");
     else if (name == "run_command") {
-        arg = args.value("command", "?");
-        if (arg.size() > 45) arg = arg.substr(0, 42) + "…";
+        arg = utf8_trunc(args.value("command", "?"), 45);
     } else if (name == "search_files")
         arg = "\"" + args.value("pattern", "?") + "\" in " + args.value("directory", ".");
     else if (name == "edit_file" || name == "write_file")
         arg = args.value("path", "?");
     else if (name == "web_search")
-        arg = "\"" + args.value("query", "?") + "\"";
-    else if (name == "fetch_url") {
-        arg = args.value("url", "?");
-        if (arg.size() > 50) arg = arg.substr(0, 47) + "…";
-    }
+        arg = "\"" + utf8_trunc(args.value("query", "?"), 40) + "\"";
+    else if (name == "fetch_url")
+        arg = utf8_trunc(args.value("url", "?"), 50);
 
     std::string out = "\n  \033[34m⦿\033[0m \033[1m" + name + "\033[0m"
                       "(\033[33m" + arg + "\033[0m)  "

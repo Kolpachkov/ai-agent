@@ -84,6 +84,23 @@ static int utf8_cols(const std::string& s) {
     }
     return c;
 }
+// Truncate to at most max_cols display columns; append "…" if cut.
+static std::string utf8_trunc(const std::string& s, int max_cols) {
+    if (utf8_cols(s) <= max_cols) return s;
+    int cols = 0;
+    size_t i = 0;
+    while (i < s.size() && cols < max_cols - 1) {
+        unsigned char b = (unsigned char)s[i];
+        i += (b < 0x80) ? 1 : (b < 0xE0) ? 2 : (b < 0xF0) ? 3 : 4;
+        cols++;
+    }
+    return s.substr(0, i) + "…";
+}
+// Pad with spaces to exactly target_cols display columns.
+static std::string utf8_pad(const std::string& s, int target_cols) {
+    const int c = utf8_cols(s);
+    return c >= target_cols ? s : s + std::string(target_cols - c, ' ');
+}
 
 // Bytes in s[0..len) that fit within max_cols display columns
 static int bytes_for_cols(const char* s, int len, int max_cols) {
@@ -460,7 +477,7 @@ static std::vector<SessionEntry> scan_sessions(const std::string& dir_raw) {
             if (msg.value("role","")=="user") {
                 std::string t=msg.value("content","");
                 while (!t.empty()&&(t.back()=='\n'||t.back()=='\r')) t.pop_back();
-                se.title = t.size()>55 ? t.substr(0,52)+"…" : t; break;
+                se.title = utf8_trunc(t, 48); break;
             }
         }
         if (se.title.empty()) se.title=e.path().stem().string();
@@ -505,12 +522,12 @@ static void display_session_history(const std::string& path) {
 // ── Session selection (runs inside TUI) ───────────────────────────────────────
 static int tui_pick_session(const std::vector<SessionEntry>& sessions) {
     std::string s = "\n  ╔══ Сессии ══════════════════════════════════════════════╗\n";
-    s += "  ║  [0]  новая сессия                                     ║\n";
+    s += "  ║  [0]  " + utf8_pad("новая сессия", 55) + "║\n";
     for (int i=0; i<(int)sessions.size(); ++i) {
-        char buf[300];
-        snprintf(buf,sizeof(buf),"  ║  [%d]  %-48s  (%2d) ║",
-                 i+1, sessions[i].title.c_str(), sessions[i].count);
-        s += std::string(buf)+"\n";
+        char buf[64];
+        snprintf(buf, sizeof(buf), "  (%2d) ║", sessions[i].count);
+        s += "  ║  [" + std::to_string(i+1) + "]  "
+           + utf8_pad(sessions[i].title, 48) + buf + "\n";
     }
     s += "  ╚═════════════════════════════════════════════════════════╝\n";
     out_push(s);

@@ -202,9 +202,11 @@ static ToolResult impl_web_search(const std::string& query) {
         for (const auto& item : j) {
             const std::string title = item.value("title", "?");
             const std::string url   = item.value("url", "");
+            const std::string date  = item.value("date", "");
             std::string body        = item.value("body", "");
-            if (body.size() > 300) body = body.substr(0, 300) + "…";
-            out += "[" + title + "](" + url + ")\n";
+            out += "[" + title + "](" + url + ")";
+            if (!date.empty()) out += "  [" + date + "]";
+            out += "\n";
             if (!body.empty()) out += body + "\n";
             out += "\n";
         }
@@ -216,12 +218,12 @@ static ToolResult impl_web_search(const std::string& query) {
 
 static ToolResult impl_fetch_url(const std::string& url) {
     if (url.empty()) return {false, "missing: url"};
-    const std::string cmd =
-        "curl -sL --max-time 15 "
-        "-H " + shell_single_quote("User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/120") +
-        " " + shell_single_quote(url) +
-        " | sed 's/<[^>]*>//g' | sed '/^[[:space:]]*$/d' | head -c 5000";
-    return impl_run_command(cmd, ".");
+    static const std::string VENV_PY = std::string(getenv("HOME") ? getenv("HOME") : "~")
+                                     + "/.cache/ai-agent/venv/bin/python3";
+    static const std::string SCRIPT  = std::string(getenv("HOME") ? getenv("HOME") : "~")
+                                     + "/.cache/ai-agent/fetch.py";
+    return impl_run_command(VENV_PY + " " + shell_single_quote(SCRIPT)
+                          + " " + shell_single_quote(url), ".");
 }
 
 // ── edit_file ─────────────────────────────────────────────────────────────────

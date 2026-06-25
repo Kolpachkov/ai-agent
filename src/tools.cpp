@@ -359,7 +359,7 @@ ToolResult ToolRegistry::call(const std::string& name, const nlohmann::json& arg
 }
 void ToolRegistry::set_working_dir(const std::string& dir) { working_dir_ = dir; }
 
-std::string ToolRegistry::system_section() const {
+std::string ToolRegistry::system_section(bool loop_enabled) const {
     std::ostringstream ss;
     ss << "\n\n--- TOOLS ---\n"
        << "Working directory: " << working_dir_ << "\n"
@@ -385,15 +385,13 @@ std::string ToolRegistry::system_section() const {
        << "  <tool_call>{\"name\": \"diff_apply\", \"arguments\": {\"diff\": \"--- a/file.c\\n+++ b/file.c\\n@@ ... \"}}</tool_call>\n\n"
        << "NOTE: In write_file/edit_file, newlines in strings must be \\n (JSON escaped).\n"
        << "PREFER edit_file over write_file for changing existing files — it's safer and uses less context.\n\n"
-       << "AUTONOMOUS LOOP:\n"
-       << "If you are in the middle of a multi-step task and already know the concrete next step,\n"
-       << "end your response with: <next>description of next step</next>\n"
-       << "The system sends it back automatically (user can interrupt with ESC).\n"
-       << "DO NOT use <next> in these cases:\n"
-       << "  - conversational replies, greetings, or answers to simple questions\n"
-       << "  - when waiting for the user to provide a task or input\n"
-       << "  - when the task is complete\n"
-       << "  - when you are unsure what to do next — ask the user instead\n\n"
+       << (loop_enabled
+           ? "AUTONOMOUS LOOP (ACTIVE — /loop to disable):\n"
+             "You are in loop mode. After completing each step of a multi-step task,\n"
+             "end your response with: <next>description of next step</next>\n"
+             "The system sends it back automatically (user can interrupt with ESC).\n"
+             "Omit <next> when: task is fully done, you need user input, or it's a conversational reply.\n\n"
+           : "")
        << "AVAILABLE TOOLS:\n";
     for (const auto& t : tools_)
         ss << "  " << t.name << " — " << t.description

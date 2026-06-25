@@ -30,6 +30,7 @@ public:
 
     void set_mode(AgentMode mode);   // switch plan/build on the fly
     AgentMode mode() const;
+    void set_loop_enabled(bool enabled);
 
     void reset_history();
     void print_info() const;
@@ -63,4 +64,5 @@ private:
     ToolRegistry         tools_;          // build mode: all tools
     ToolRegistry         tools_readonly_; // plan mode: read-only tools
     AppConfig            cfg_;
+    bool                 loop_enabled_ = false;
 };

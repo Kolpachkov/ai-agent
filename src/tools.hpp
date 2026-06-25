@@ -23,7 +23,7 @@ public:
     void        add(Tool tool);
     bool        has(const std::string& name) const;
     ToolResult  call(const std::string& name, const nlohmann::json& args) const;
-    std::string system_section() const;  // Injected into system prompt
+    std::string system_section(bool loop_enabled = false) const;
 
 private:
     std::vector<Tool> tools_;

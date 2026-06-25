@@ -215,7 +215,7 @@ Agent::Agent(const AppConfig& cfg) : cfg_(cfg) {
     // Build system prompt based on current mode
     std::string sys = active_system_prompt();
     if (cfg_.tools.enabled)
-        sys += active_tools().system_section();
+        sys += active_tools().system_section(loop_enabled_);
     history_.push_back({Message::Role::System, sys});
 
     if (cfg_.agent.verbose) print_info();
@@ -246,7 +246,7 @@ void Agent::set_mode(AgentMode mode) {
     // Rebuild system message in history
     std::string sys = active_system_prompt();
     if (cfg_.tools.enabled)
-        sys += active_tools().system_section();
+        sys += active_tools().system_section(loop_enabled_);
     history_[0] = {Message::Role::System, sys};
     // Clear KV cache so new system prompt takes effect
     llama_memory_clear(llama_get_memory(impl_->ctx), true);
@@ -254,6 +254,17 @@ void Agent::set_mode(AgentMode mode) {
 }
 
 AgentMode Agent::mode() const { return cfg_.agent.mode; }
+
+void Agent::set_loop_enabled(bool enabled) {
+    loop_enabled_ = enabled;
+    // Rebuild system message so <next> instructions appear/disappear immediately
+    std::string sys = active_system_prompt();
+    if (cfg_.tools.enabled)
+        sys += active_tools().system_section(loop_enabled_);
+    history_[0] = {Message::Role::System, sys};
+    llama_memory_clear(llama_get_memory(impl_->ctx), true);
+    impl_->n_past = 0;
+}
 
 // ── Prompt building ───────────────────────────────────────────────────────────
 std::string Agent::build_prompt() const {
@@ -812,7 +823,7 @@ std::string Agent::chat(const std::string& user_msg, StreamCallback cb, ThinkCal
 // ── Utility ───────────────────────────────────────────────────────────────────
 void Agent::reset_history() {
     std::string sys = active_system_prompt();
-    if (cfg_.tools.enabled) sys += active_tools().system_section();
+    if (cfg_.tools.enabled) sys += active_tools().system_section(loop_enabled_);
 
     history_.clear();
     history_.push_back({Message::Role::System, sys});

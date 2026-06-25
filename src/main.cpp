@@ -48,6 +48,7 @@ static int               g_spinner_frame{0};
 static int               g_scroll_top{-1};   // -1 = auto, >= 0 = frozen line
 
 // autonomous loop: gen_thread sets g_loop_next when response contains <next>…</next>
+static std::atomic<bool>     g_loop_enabled{false};
 static std::string           g_loop_next;
 static std::mutex            g_loop_mu;
 
@@ -245,7 +246,8 @@ static void draw_header(AgentMode mode, const std::string& model_name) {
     const char* ms = (mode == AgentMode::Plan) ? "PLAN" : "BUILD";
     std::string spin = g_generating ? std::string(" ")+SPINNER[g_spinner_frame%SPINNER_N] : "";
     std::string stag = (g_scroll_top >= 0) ? " [↑]" : "";
-    std::string left = " ◆ ai-agent  |  " + std::string(ms) + spin + stag + "  |  " + model_name;
+    std::string loop_tag = g_loop_enabled ? " ⟳" : "";
+    std::string left = " ◆ ai-agent  |  " + std::string(ms) + loop_tag + spin + stag + "  |  " + model_name;
     const std::string right = " колесо: скрол  Shift+drag: копи  ESC: стоп ";
     const int pad = COLS - utf8_cols(left) - utf8_cols(right);
     for (int i=0; i<pad; ++i) left += ' ';
@@ -795,8 +797,8 @@ int main(int argc, char** argv) {
                 out_push("\n");
                 agent->save_history();
 
-                // Extract <next>task</next> for autonomous loop
-                if (!g_interrupted) {
+                // Extract <next>task</next> for autonomous loop (only when enabled)
+                if (!g_interrupted && g_loop_enabled) {
                     const size_t ns = full_resp.find("<next>");
                     const size_t ne = full_resp.find("</next>");
                     if (ns != std::string::npos && ne != std::string::npos && ne > ns) {
@@ -946,6 +948,14 @@ int main(int argc, char** argv) {
                         out_push("[error loading model: "+std::string(e.what())+"]\n");
                     }
                 }
+                continue;
+            }
+            if (line=="/loop"){
+                g_loop_enabled = !g_loop_enabled;
+                { std::lock_guard<std::mutex> lk(g_loop_mu); g_loop_next.clear(); }
+                agent->set_loop_enabled(g_loop_enabled);
+                out_push(g_loop_enabled ? "[loop: ON — агент будет продолжать автономно]\n"
+                                        : "[loop: OFF]\n");
                 continue;
             }
             if (line=="/mouse"){ toggle_mouse(); continue; }

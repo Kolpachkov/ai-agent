@@ -386,10 +386,14 @@ std::string ToolRegistry::system_section() const {
        << "NOTE: In write_file/edit_file, newlines in strings must be \\n (JSON escaped).\n"
        << "PREFER edit_file over write_file for changing existing files — it's safer and uses less context.\n\n"
        << "AUTONOMOUS LOOP:\n"
-       << "To continue automatically after finishing a step, end your response with:\n"
-       << "  <next>description of the next step</next>\n"
-       << "The system will send it back as your next input automatically (user can interrupt with ESC).\n"
-       << "Omit <next> when the task is fully complete.\n\n"
+       << "If you are in the middle of a multi-step task and already know the concrete next step,\n"
+       << "end your response with: <next>description of next step</next>\n"
+       << "The system sends it back automatically (user can interrupt with ESC).\n"
+       << "DO NOT use <next> in these cases:\n"
+       << "  - conversational replies, greetings, or answers to simple questions\n"
+       << "  - when waiting for the user to provide a task or input\n"
+       << "  - when the task is complete\n"
+       << "  - when you are unsure what to do next — ask the user instead\n\n"
        << "AVAILABLE TOOLS:\n";
     for (const auto& t : tools_)
         ss << "  " << t.name << " — " << t.description

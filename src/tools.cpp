@@ -6,8 +6,17 @@
 #include <cstdio>
 #include <stdexcept>
 #include <algorithm>
+#include <atomic>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/select.h>
+#include <ctime>
 
 namespace fs = std::filesystem;
+
+static std::atomic<bool>* g_stop = nullptr;
+void set_stop_flag(std::atomic<bool>* f) { g_stop = f; }
 
 // Percent-encode a string for use in URLs.
 static std::string url_encode(const std::string& s) {
@@ -68,20 +77,61 @@ static std::string shell_single_quote(const std::string& s) {
 }
 
 static ToolResult impl_run_command(const std::string& cmd, const std::string& working_dir) {
-    std::array<char, 4096> buf;
-    std::string output;
     const std::string safe_cmd =
         "cd " + shell_single_quote(working_dir) +
         " && timeout 30s sh -c " + shell_single_quote(cmd) + " 2>&1";
-    FILE* pipe = popen(safe_cmd.c_str(), "r");
-    if (!pipe) return {false, "popen failed"};
-    while (fgets(buf.data(), buf.size(), pipe)) {
-        output += buf.data();
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return {false, "pipe failed"};
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        return {false, "fork failed"};
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execl("/bin/sh", "sh", "-c", safe_cmd.c_str(), nullptr);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    std::string output;
+    char buf[4096];
+    bool interrupted = false;
+
+    while (true) {
+        fd_set fds; FD_ZERO(&fds); FD_SET(pipefd[0], &fds);
+        struct timeval tv = {0, 100000};  // 100ms poll interval
+        const int r = select(pipefd[0] + 1, &fds, nullptr, nullptr, &tv);
+        if (r < 0) break;
+        if (r == 0) {
+            if (g_stop && g_stop->load()) { interrupted = true; kill(pid, SIGTERM); break; }
+            continue;
+        }
+        const ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        output += buf;
         if (output.size() > 8000) { output += "\n... [truncated]"; break; }
     }
-    const int rc = pclose(pipe);
-    if (rc != 0)
-        output = "[exit " + std::to_string(rc) + "]\n" + output;
+    close(pipefd[0]);
+
+    if (interrupted) {
+        struct timespec ts = {0, 200000000};  // 200ms for graceful exit
+        nanosleep(&ts, nullptr);
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); }
+        return {false, output.empty() ? "[interrupted]" : output + "\n[interrupted]"};
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    const int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (rc != 0) output = "[exit " + std::to_string(rc) + "]\n" + output;
     return {rc == 0, output.empty() ? "(no output)" : output};
 }
 
@@ -192,13 +242,19 @@ std::string ToolRegistry::system_section() const {
     std::ostringstream ss;
     ss << "\n\n--- TOOLS ---\n"
        << "Working directory: " << working_dir_ << "\n"
-       << "All relative paths are resolved from this directory.\n"
-       << "Call a tool by outputting EXACTLY this format (valid JSON only):\n"
-       << "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"key\": \"value\"}}</tool_call>\n"
-       << "Wait for the next turn before making another call.\n"
-       << "CRITICAL for write_file: escape newlines in content as \\n. Example:\n"
-       << "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"./proj/f.cpp\", \"content\": \"line1\\nline2\\n\"}}</tool_call>\n\n"
-       << "Available tools:\n";
+       << "Relative paths resolve from this directory.\n\n"
+       << "CALL FORMAT — output exactly, ONE call per turn, then stop:\n"
+       << "<tool_call>{\"name\": \"TOOL\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n\n"
+       << "EXAMPLES:\n"
+       << "  <tool_call>{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"./src/main.cpp\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"run_command\", \"arguments\": {\"command\": \"gcc --version\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"search_files\", \"arguments\": {\"pattern\": \"TODO\", \"directory\": \"./src\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"cmake find_package tutorial\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"fetch_url\", \"arguments\": {\"url\": \"https://example.com\"}}</tool_call>\n"
+       << "  <tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"./out.txt\", \"content\": \"line1\\nline2\\n\"}}</tool_call>\n\n"
+       << "NOTE: In write_file \"content\", newlines must be written as \\n (JSON escaped).\n\n"
+       << "AVAILABLE TOOLS:\n";
     for (const auto& t : tools_)
         ss << "  " << t.name << " — " << t.description
            << "\n    args: " << t.params_doc << "\n";

@@ -175,6 +175,10 @@ Agent::Agent(const AppConfig& cfg) : cfg_(cfg) {
     mparams.n_gpu_layers = cfg_.model.n_gpu_layers;
     mparams.use_mmap     = cfg_.model.mmap;
     mparams.use_mlock    = cfg_.model.mlock;
+    // SPLIT_MODE_NONE avoids the ggml scheduler assertion that fires on Gemma 4
+    // with SPLIT_MODE_LAYER when doing CPU/GPU hybrid inference on a single GPU.
+    if (cfg_.model.n_gpu_layers > 0)
+        mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
 
     impl_->model = llama_model_load_from_file(cfg_.model.path.c_str(), mparams);
     if (!impl_->model)

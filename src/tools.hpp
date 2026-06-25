@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <atomic>
 #include <nlohmann/json.hpp>
 
 struct ToolResult {
@@ -31,3 +32,5 @@ private:
 
 ToolRegistry make_default_tools(const std::string& working_dir = ".");
 ToolRegistry make_readonly_tools(const std::string& working_dir = ".");  // list_dir, read_file, search_files only
+
+void set_stop_flag(std::atomic<bool>* flag);  // call once; impl_run_command polls it every 100ms

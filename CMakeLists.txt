@@ -35,6 +35,14 @@ target_compile_options(ai-agent PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/O2 /W3>
 )
 
+# Prefer the locally-built llama.cpp libs (with patched GGML_SCHED_MAX_SPLIT_INPUTS)
+# over whatever is installed system-wide, so GPU offload works with Gemma 4.
+set_target_properties(ai-agent PROPERTIES
+    BUILD_RPATH "$ENV{HOME}/llama.cpp-cuda/build/bin"
+    INSTALL_RPATH "$ENV{HOME}/llama.cpp-cuda/build/bin"
+    BUILD_RPATH_USE_ORIGIN ON
+)
+
 # ── Tests (no llama dependency) ───────────────────────────────────────────────
 enable_testing()
 

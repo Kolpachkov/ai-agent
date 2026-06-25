@@ -668,6 +668,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<Agent> agent;
     try { agent = std::make_unique<Agent>(cfg); }
     catch(const std::exception& e){ std::cerr<<"[error] "<<e.what()<<"\n"; return 1; }
+    set_stop_flag(&g_interrupted);
     std::cerr<<"[info] Ready.\n";
 
     // ── ncurses ───────────────────────────────────────────────────────────────
@@ -821,12 +822,13 @@ int main(int argc, char** argv) {
             if (gen_thread.joinable()) gen_thread.join();
 
             gen_thread = std::thread([&, line]() {
+                const auto t0 = std::chrono::steady_clock::now();
                 try {
                     auto stream_cb = [&](const std::string& piece) -> bool {
                         out_push(strip_ansi(piece));
                         return !g_interrupted;
                     };
-                    auto think_cb = [&]() { out_push("[thinking...]\n"); };
+                    auto think_cb = [&]() { ++g_spinner_frame; };
                     agent->chat(line, stream_cb, think_cb);
                     out_push("\n");
                     agent->save_history();
@@ -834,6 +836,13 @@ int main(int argc, char** argv) {
                     out_push("\n[error: "+std::string(e.what())+"]\n");
                 }
                 if (g_interrupted) out_push("[interrupted]\n");
+                const double secs = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                char tbuf[48];
+                const int m = (int)(secs / 60);
+                if (m == 0) snprintf(tbuf, sizeof(tbuf), "  ╰─ %.1f с\n", secs);
+                else        snprintf(tbuf, sizeof(tbuf), "  ╰─ %d м %d с\n", m, (int)secs % 60);
+                out_push(tbuf);
                 g_generating=false; g_interrupted=false;
             });
             continue;
